@@ -50,6 +50,13 @@ const access = new Set([
   "admin_password",
   "api_password",
   "sync_password_mode",
+  "oidc_enabled",
+  "oidc_name",
+  "oidc_issuer",
+  "oidc_client_id",
+  "oidc_client_secret",
+  "oidc_auto_create",
+  "password_login_users",
 ]);
 const preferences = new Set([
   "display_weight_unit",
@@ -82,7 +89,7 @@ export async function exportBackup(db: D1Database): Promise<Backup> {
   const accounts = (
     await db
       .prepare(
-        "SELECT id,username,password_hash,role,disabled,oidc_issuer,oidc_subject FROM accounts ORDER BY id",
+        "SELECT id,username,password_hash,role,disabled,see_all,oidc_issuer,oidc_subject,oidc_username,sync_token_hash FROM accounts ORDER BY id",
       )
       .all<Row>()
   ).results;
@@ -143,6 +150,9 @@ function validAccounts(value: string): void {
       names.has(name) ||
       !["admin", "user"].includes(a.role) ||
       ![0, 1].includes(a.disabled) ||
+      !(a.see_all === undefined || [0, 1].includes(a.see_all)) ||
+      !(a.oidc_username == null || (typeof a.oidc_username === "string" && a.oidc_username.length <= 64)) ||
+      !(a.sync_token_hash == null || /^[a-f0-9]{64}$/.test(a.sync_token_hash)) ||
       !(a.password_hash === null || PASSWORD_HASH.test(a.password_hash)) ||
       !["string", "object"].includes(typeof a.oidc_issuer) ||
       !["string", "object"].includes(typeof a.oidc_subject) ||
@@ -589,7 +599,7 @@ export async function commitBackup(
   if (restoreAccess) {
     statements.push(
       db.prepare(
-        "DELETE FROM settings WHERE key IN ('admin_password','api_password','sync_password_mode')",
+        "DELETE FROM settings WHERE key IN ('admin_password','api_password','sync_password_mode','oidc_enabled','oidc_name','oidc_issuer','oidc_client_id','oidc_client_secret','oidc_auto_create','password_login_users')",
       ),
     );
     statements.push(
@@ -606,7 +616,7 @@ export async function commitBackup(
     statements.push(
       db
         .prepare(
-          `INSERT INTO accounts(username,password_hash,role,disabled,oidc_issuer,oidc_subject,created_at) SELECT json_extract(a.value,'$.username'),json_extract(a.value,'$.password_hash'),json_extract(a.value,'$.role'),json_extract(a.value,'$.disabled'),json_extract(a.value,'$.oidc_issuer'),json_extract(a.value,'$.oidc_subject'),${now()} ${staged}`,
+          `INSERT INTO accounts(username,password_hash,role,disabled,see_all,oidc_issuer,oidc_subject,oidc_username,sync_token_hash,created_at) SELECT json_extract(a.value,'$.username'),json_extract(a.value,'$.password_hash'),json_extract(a.value,'$.role'),json_extract(a.value,'$.disabled'),COALESCE(json_extract(a.value,'$.see_all'),1),json_extract(a.value,'$.oidc_issuer'),json_extract(a.value,'$.oidc_subject'),json_extract(a.value,'$.oidc_username'),json_extract(a.value,'$.sync_token_hash'),${now()} ${staged}`,
         )
         .bind(id),
     );

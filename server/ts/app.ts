@@ -6,6 +6,16 @@ import {
   storedMeasures,
 } from "./metrics.ts";
 import { refreshRecognitionWeight } from "./recognition.ts";
+import {
+  authorizationUrl,
+  discover,
+  exchangeCode,
+  normalizeIssuer,
+  pkce,
+  verifyIdToken,
+  type Claims,
+  type OidcConfig,
+} from "./oidc.ts";
 import { exportBackup, stageBackup, commitBackup } from "./backup.ts";
 import {
   firmwareObservation,
@@ -15,6 +25,7 @@ import {
   firmwareWorkspace,
   scalesWorkspace,
   accountsSection,
+  oidcSection,
   settingsWorkspace,
   syncPage,
 } from "./integrated_ui.ts";
@@ -36,6 +47,7 @@ import {
 import {
   accountPage,
   dashboardPage,
+  syncTokenPage,
   escapeHtml,
   layout,
   loginPage,
@@ -58,6 +70,8 @@ export interface AppEnv {
   YOW_BOOTSTRAP_TOKEN?: string;
   captureWithings?: (scale: Row) => Promise<string>;
   lookupFirmwareOffer?: (identity: Row) => Promise<Row>;
+  /** Fetch used for OIDC discovery, token and key requests (tests inject one). */
+  oidcFetch?: typeof fetch;
 }
 const SCALE_PATHS = new Set([
   "/once",
@@ -266,6 +280,8 @@ export type Account = {
   id: number;
   username: string;
   role: "admin" | "user";
+  /** Sees every person: an administrator who did not narrow their own view. */
+  all: boolean;
   userIds: number[];
 };
 async function browserSession(
@@ -335,9 +351,14 @@ async function currentAccount(
     session.auth_version !== Number((await setting(db, "auth_version")) ?? "0")
   )
     return null;
-  const account = await one<{ id: number; username: string; role: string }>(
+  const account = await one<{
+    id: number;
+    username: string;
+    role: string;
+    see_all: number;
+  }>(
     db,
-    "SELECT id,username,role FROM accounts WHERE id=? AND disabled=0",
+    "SELECT id,username,role,see_all FROM accounts WHERE id=? AND disabled=0",
     session.account_id,
   );
   if (!account) return null;
@@ -350,17 +371,234 @@ async function currentAccount(
     id: account.id,
     username: account.username,
     role: account.role === "admin" ? "admin" : "user",
+    all: account.role === "admin" && account.see_all === 1,
     userIds: people.map((row) => row.user_id),
   };
 }
-/** Admins see every person; other accounts only the people linked to them. */
+/** Views show every person only to administrators who did not narrow them. */
 const canSeeUser = (account: Account, userId: number): boolean =>
-  account.role === "admin" || account.userIds.includes(userId);
+  account.all || account.userIds.includes(userId);
 /** SQL fragment limiting `column` to the people an account may see. */
 const userScope = (account: Account, column: string): string =>
-  account.role === "admin"
+  account.all
     ? ""
     : ` AND ${column} IN (${account.userIds.map(Number).join(",") || "NULL"})`;
+type OidcSettings = {
+  enabled: boolean;
+  name: string;
+  issuer: string;
+  clientId: string;
+  hasSecret: boolean;
+  autoCreate: boolean;
+  /** Whether accounts with the role "user" may still sign in with a password. */
+  passwordUsers: boolean;
+  config: OidcConfig | null;
+};
+async function oidcSettings(db: D1Database): Promise<OidcSettings> {
+  const issuer = (await setting(db, "oidc_issuer")) ?? "";
+  const clientId = (await setting(db, "oidc_client_id")) ?? "";
+  const secret = (await setting(db, "oidc_client_secret")) ?? "";
+  const enabled =
+    (await setting(db, "oidc_enabled")) === "1" &&
+    !!issuer &&
+    !!clientId &&
+    !!secret;
+  return {
+    enabled,
+    name: (await setting(db, "oidc_name")) || "OIDC",
+    issuer,
+    clientId,
+    hasSecret: !!secret,
+    autoCreate: (await setting(db, "oidc_auto_create")) === "1",
+    passwordUsers: (await setting(db, "password_login_users")) !== "0",
+    config: enabled ? { issuer, clientId, clientSecret: secret } : null,
+  };
+}
+const peopleByName = async (db: D1Database, name: string): Promise<number[]> =>
+  (
+    await rows<{ id: number }>(
+      db,
+      "SELECT id FROM users WHERE LOWER(name)=LOWER(?) OR LOWER(short_name)=LOWER(?)",
+      name,
+      name,
+    )
+  ).map((row) => row.id);
+const oidcCookie = (value: string, maxAge: number, secure: boolean) =>
+  `yow_oidc=${value}; HttpOnly; ${secure ? "Secure; " : ""}SameSite=Lax; Path=/login/oidc; Max-Age=${maxAge}`;
+/** The account an OIDC identity signs in as: known subject, pre-provisioned name, or auto-created. */
+async function oidcAccount(
+  db: D1Database,
+  claims: Claims,
+  settings: OidcSettings,
+): Promise<number> {
+  const issuer = settings.issuer;
+  const known = await one<{ id: number; disabled: number }>(
+    db,
+    "SELECT id,disabled FROM accounts WHERE oidc_issuer=? AND oidc_subject=?",
+    issuer,
+    claims.sub,
+  );
+  if (known) {
+    if (known.disabled) throw new Error("This account is disabled");
+    return known.id;
+  }
+  const names = [claims.preferred_username, claims.email]
+    .filter((value): value is string => typeof value === "string" && !!value)
+    .map((value) => value.toLowerCase());
+  for (const name of names) {
+    const expected = await one<{ id: number }>(
+      db,
+      "SELECT id FROM accounts WHERE oidc_subject IS NULL AND disabled=0 AND LOWER(oidc_username)=?",
+      name,
+    );
+    if (expected) {
+      await run(
+        db,
+        "UPDATE accounts SET oidc_issuer=?,oidc_subject=? WHERE id=?",
+        issuer,
+        claims.sub,
+        expected.id,
+      );
+      return expected.id;
+    }
+  }
+  if (!settings.autoCreate)
+    throw new Error(
+      "No account is linked to this OIDC login. Ask an administrator.",
+    );
+  const base =
+    (claims.preferred_username || claims.email?.split("@")[0] || "user")
+      .replace(/[\s:\u0000-\u001f]+/gu, ".")
+      .slice(0, 60) || "user";
+  let username = base;
+  for (let n = 2; await one(db, "SELECT id FROM accounts WHERE username=?", username); n++)
+    username = `${base}${n}`;
+  await run(
+    db,
+    "INSERT INTO accounts(username,password_hash,role,oidc_issuer,oidc_subject,oidc_username,created_at) VALUES(?,NULL,'user',?,?,?,?)",
+    username,
+    issuer,
+    claims.sub,
+    claims.preferred_username ?? null,
+    now(),
+  );
+  const created = (await one<{ id: number }>(
+    db,
+    "SELECT id FROM accounts WHERE username=?",
+    username,
+  ))!;
+  const people = await peopleByName(db, username);
+  if (people.length) await db.batch(linkPeople(db, created.id, people));
+  return created.id;
+}
+async function oidcRoute(
+  request: Request,
+  env: AppEnv,
+  db: D1Database,
+  url: URL,
+): Promise<Response> {
+  const settings = await oidcSettings(db);
+  const secure = url.protocol === "https:";
+  const fail = (message: string) =>
+    redirect("/login", message, undefined);
+  if (!settings.config) return fail("OIDC sign-in is not enabled");
+  const redirectUri = `${url.origin}/login/oidc/callback`;
+  try {
+    if (url.pathname === "/login/oidc") {
+      const d = await discover(settings.config.issuer, env.oidcFetch);
+      const state = randomHex(24);
+      const nonce = randomHex(24);
+      const { verifier, challenge } = await pkce();
+      await db.batch([
+        db.prepare("DELETE FROM oidc_logins WHERE expires_at<=?").bind(now()),
+        db
+          .prepare(
+            "INSERT INTO oidc_logins(state_hash,nonce,verifier,expires_at) VALUES(?,?,?,?)",
+          )
+          .bind(await digest(state), nonce, verifier, now() + 600),
+      ]);
+      return new Response(null, {
+        status: 303,
+        headers: {
+          Location: authorizationUrl(
+            d,
+            settings.config,
+            redirectUri,
+            state,
+            nonce,
+            challenge,
+          ),
+          "Cache-Control": "no-store",
+          "Set-Cookie": oidcCookie(state, 600, secure),
+        },
+      });
+    }
+    // Callback: only the browser that started the login may finish it.
+    if (await authLimit(db, request, "login"))
+      return fail("Too many attempts; try again in ten minutes");
+    const state = url.searchParams.get("state") ?? "";
+    const code = url.searchParams.get("code") ?? "";
+    const cookie =
+      /(?:^|;\s*)yow_oidc=([a-f0-9]{48})(?:;|$)/.exec(
+        request.headers.get("Cookie") ?? "",
+      )?.[1] ?? "";
+    const login = state
+      ? await one<{ nonce: string; verifier: string }>(
+          db,
+          "SELECT nonce,verifier FROM oidc_logins WHERE state_hash=? AND expires_at>?",
+          await digest(state),
+          now(),
+        )
+      : null;
+    // The state is single-use whatever happens next.
+    if (state)
+      await run(
+        db,
+        "DELETE FROM oidc_logins WHERE state_hash=?",
+        await digest(state),
+      );
+    if (
+      !login ||
+      !code ||
+      url.searchParams.has("error") ||
+      !equal(cookie, state)
+    ) {
+      await authLimit(db, request, "login", true);
+      return fail("OIDC sign-in failed; start again");
+    }
+    const d = await discover(settings.config.issuer, env.oidcFetch);
+    const claims = await verifyIdToken(
+      await exchangeCode(
+        d,
+        settings.config,
+        redirectUri,
+        code,
+        login.verifier,
+        env.oidcFetch,
+      ),
+      d,
+      settings.config,
+      login.nonce,
+      env.oidcFetch,
+    );
+    const accountId = await oidcAccount(db, claims, settings);
+    await authLimit(db, request, "login", false);
+    const { row } = await browserSession(db, request);
+    const session = await rotateSession(db, row, accountId, secure);
+    // A page instead of a redirect: the SameSite=Strict session cookie is not
+    // sent while the navigation still started on the identity provider's site.
+    const response = html(
+      `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=/"><title>YourOwnWeigh</title><p><a href="/">Continue</a></p>`,
+      200,
+      session,
+    );
+    response.headers.append("Set-Cookie", oidcCookie("", 0, secure));
+    return response;
+  } catch (error) {
+    await authLimit(db, request, "login", true);
+    return fail(safeError(error));
+  }
+}
 function validUsername(value: string): string {
   const name = value.trim();
   if (!name || name.length > 64 || /[\s:\u0000-\u001f]/u.test(name))
@@ -1019,14 +1257,22 @@ async function syncScope(
   const account = await one<{
     id: number;
     role: string;
+    see_all: number;
     password_hash: string | null;
+    sync_token_hash: string | null;
   }>(
     db,
-    "SELECT id,role,password_hash FROM accounts WHERE username=? AND disabled=0",
+    "SELECT id,role,see_all,password_hash,sync_token_hash FROM accounts WHERE username=? AND disabled=0",
     name,
   );
-  if (account && (await passwordMatches(password, account.password_hash))) {
-    if (account.role === "admin") return { all: true };
+  // The account password, or the Sync token of an account that has no password.
+  if (
+    account &&
+    ((await passwordMatches(password, account.password_hash)) ||
+      (!!account.sync_token_hash &&
+        equal(await digest(password), account.sync_token_hash)))
+  ) {
+    if (account.role === "admin" && account.see_all === 1) return { all: true };
     const people = await rows<{ user_id: number }>(
       db,
       "SELECT user_id FROM account_users WHERE account_id=?",
@@ -1721,6 +1967,11 @@ export async function handleApp(
       ? env.bridgeRequest(request, null)
       : json({ error: "Bridge is unavailable" }, 503);
   }
+  if (
+    method === "GET" &&
+    (path === "/login/oidc" || path === "/login/oidc/callback")
+  )
+    return oidcRoute(request, env, db, url);
   const adminConfigured = await adminExists(db);
   if (!cookieValue(request) && path !== "/setup" && path !== "/login") {
     return redirect(adminConfigured ? "/login" : "/setup");
@@ -1879,6 +2130,25 @@ export async function handleApp(
     const submitted = await request.formData();
     if (!equal(formText(submitted, "_csrf"), csrf))
       return new Response("Invalid CSRF token", { status: 403 });
+    if (
+      account &&
+      path === "/account" &&
+      formText(submitted, "purpose") === "sync_token"
+    ) {
+      // Shown once: only a hash is stored.
+      const token = `yow_${randomHex(24)}`;
+      await run(
+        db,
+        "UPDATE accounts SET sync_token_hash=? WHERE id=?",
+        await digest(token),
+        account.id,
+      );
+      return page(
+        t("nav.account"),
+        syncTokenPage(token, account.username, language),
+        "/account",
+      );
+    }
     return browserPost(
       request,
       db,
@@ -1889,6 +2159,7 @@ export async function handleApp(
       cookie,
       env.YOW_BOOTSTRAP_TOKEN,
       env.captureWithings,
+      env.oidcFetch,
     );
   }
   if (method !== "GET")
@@ -1904,7 +2175,19 @@ export async function handleApp(
   if (path === "/login")
     return loggedIn
       ? go("/")
-      : page(t("auth.signIn"), loginPage(csrf, t));
+      : page(
+          t("auth.signIn"),
+          loginPage(
+            csrf,
+            t,
+            (await oidcSettings(db)).enabled
+              ? {
+                  name: (await oidcSettings(db)).name,
+                  passwordUsers: (await oidcSettings(db)).passwordUsers,
+                }
+              : undefined,
+          ),
+        );
   if (!account) return go("/login");
   if (
     !isAdmin &&
@@ -1929,11 +2212,18 @@ export async function handleApp(
           csrf,
           await rows(
             db,
-            "SELECT id,username,role,disabled FROM accounts ORDER BY username",
+            "SELECT id,username,role,disabled,see_all,oidc_username,oidc_subject IS NOT NULL AS oidc_linked,password_hash IS NOT NULL AS has_password FROM accounts ORDER BY username",
           ),
           await accountLinks(db),
           await rows(db, "SELECT id,name FROM users ORDER BY name,id"),
           account.id,
+          language,
+          (await oidcSettings(db)).enabled,
+        ) +
+        oidcSection(
+          csrf,
+          { ...(await oidcSettings(db)), enabled: (await setting(db, "oidc_enabled")) === "1" },
+          `${url.origin}/login/oidc/callback`,
           language,
         ),
       "/admin",
@@ -1949,6 +2239,11 @@ export async function handleApp(
         ),
         csrf,
         language,
+        !!(await one(
+          db,
+          "SELECT 1 AS found FROM accounts WHERE id=? AND sync_token_hash IS NOT NULL",
+          account.id,
+        )),
       ),
       "/account",
     );
@@ -1984,7 +2279,7 @@ export async function handleApp(
         (await setting(db, "display_weight_unit")) ?? "kg",
         await rows(
           db,
-          isAdmin
+          account.all
             ? "SELECT label,model,battery_level,last_session_at FROM scales ORDER BY label,id"
             : `SELECT DISTINCT s.id,s.label,s.model,s.battery_level,s.last_session_at FROM scales s JOIN scale_users su ON su.scale_id=s.id WHERE 1=1${userScope(account, "su.user_id")} ORDER BY s.label,s.id`,
         ),
@@ -1996,21 +2291,21 @@ export async function handleApp(
   if (path === "/readings") {
     const metrics = await observedMetrics(
       db,
-      isAdmin ? undefined : { userIds: account.userIds, unassigned: true },
+      account.all ? undefined : { userIds: account.userIds, unassigned: true },
     );
     const metric =
       metrics.find((m) => m.type === Number(url.searchParams.get("metric")))
         ?.type ?? 1;
     const users = await rows(
       db,
-      `SELECT id,name FROM users WHERE active=1${userScope(account, "id")} ORDER BY name,id`,
+      `SELECT id,name FROM users WHERE active=1${isAdmin ? "" : userScope(account, "id")} ORDER BY name,id`,
     );
     const readings = await rows(
       db,
       `SELECT r.*,s.label AS scale_label,u.name AS user_name,
       h.synced_at AS health_sync_acknowledged_at FROM readings r JOIN scales s ON s.id=r.scale_id
       LEFT JOIN users u ON u.id=r.user_id LEFT JOIN health_sync_receipts h ON h.reading_id=r.id AND h.user_id=r.user_id
-      WHERE ${metric === 1 ? "r.weight_value IS NOT NULL" : "EXISTS (SELECT 1 FROM json_each(r.measures_json) m WHERE json_extract(m.value,'$.type')=?)"}${isAdmin ? "" : ` AND (r.user_id IS NULL OR r.user_id IN (${account.userIds.map(Number).join(",") || "NULL"}))`}
+      WHERE ${metric === 1 ? "r.weight_value IS NOT NULL" : "EXISTS (SELECT 1 FROM json_each(r.measures_json) m WHERE json_extract(m.value,'$.type')=?)"}${account.all ? "" : ` AND (r.user_id IS NULL OR r.user_id IN (${account.userIds.map(Number).join(",") || "NULL"}))`}
       ORDER BY ${readingOrder} LIMIT 10`,
       ...(metric === 1 ? [] : [metric]),
     );
@@ -2303,15 +2598,27 @@ async function accountsPost(
   if (path === "/accounts") {
     const username = validUsername(formText(form, "username"));
     const role = formText(form, "role") === "admin" ? "admin" : "user";
-    const encoded = await passwordHash(formText(form, "password"));
+    const oidcName = formText(form, "oidc_username").trim().slice(0, 64);
+    const password = formText(form, "password");
+    // Without a password the account signs in through OIDC only.
+    if (!password) {
+      if (role === "admin") throw new Error("Administrators need a password");
+      if (!oidcName || !(await oidcSettings(db)).enabled)
+        throw new Error(
+          "A password, or an OIDC username with OIDC enabled, is required",
+        );
+    }
+    const encoded = password ? await passwordHash(password) : null;
     if (await one(db, "SELECT id FROM accounts WHERE username=?", username))
       throw new Error("Username is already taken");
     await run(
       db,
-      "INSERT INTO accounts(username,password_hash,role,created_at) VALUES(?,?,?,?)",
+      "INSERT INTO accounts(username,password_hash,role,see_all,oidc_username,created_at) VALUES(?,?,?,?,?,?)",
       username,
       encoded,
       role,
+      formText(form, "see_all") === "1" ? 1 : 0,
+      oidcName || null,
       now(),
     );
     const created = (await one<{ id: number }>(
@@ -2322,14 +2629,7 @@ async function accountsPost(
     let people = await existingPeople(db, form);
     // Nobody picked: link the people whose name or short name equals the username.
     if (!people.length && role === "user")
-      people = (
-        await rows<{ id: number }>(
-          db,
-          "SELECT id FROM users WHERE LOWER(name)=LOWER(?) OR LOWER(short_name)=LOWER(?)",
-          username,
-          username,
-        )
-      ).map((row) => row.id);
+      people = await peopleByName(db, username);
     if (people.length) await db.batch(linkPeople(db, created.id, people));
     return go(
       "/admin",
@@ -2340,9 +2640,15 @@ async function accountsPost(
   }
   const match = /^\/accounts\/(\d+)(\/delete)?$/.exec(path)!;
   const id = Number(match[1]);
-  const target = await one<{ id: number; role: string; disabled: number }>(
+  const target = await one<{
+    id: number;
+    role: string;
+    disabled: number;
+    password_hash: string | null;
+    oidc_subject: string | null;
+  }>(
     db,
-    "SELECT id,role,disabled FROM accounts WHERE id=?",
+    "SELECT id,role,disabled,password_hash,oidc_subject FROM accounts WHERE id=?",
     id,
   );
   if (!target) return new Response("Not Found", { status: 404 });
@@ -2371,10 +2677,48 @@ async function accountsPost(
     throw new Error("There must be at least one active administrator");
   const password = formText(form, "password");
   const encoded = password ? await passwordHash(password) : null;
+  const oidcName = formText(form, "oidc_username").trim().slice(0, 64);
+  const removePassword = formText(form, "remove_password") === "1";
+  if (removePassword && password)
+    throw new Error("Choose either a new password or removing the password");
+  if (
+    removePassword &&
+    (!(oidcName || target.oidc_subject) || !(await oidcSettings(db)).enabled)
+  )
+    throw new Error(
+      "A password can only be removed when OIDC is enabled and the account has an OIDC login",
+    );
+  if (role === "admin" && (removePassword || (!password && !target.password_hash)))
+    throw new Error("Administrators need a password");
   await db.batch([
     db
-      .prepare("UPDATE accounts SET role=?,disabled=? WHERE id=?")
-      .bind(role, disabled, id),
+      .prepare(
+        "UPDATE accounts SET role=?,disabled=?,see_all=?,oidc_username=? WHERE id=?",
+      )
+      .bind(
+        role,
+        disabled,
+        formText(form, "see_all") === "1" ? 1 : 0,
+        oidcName || null,
+        id,
+      ),
+    ...(formText(form, "unlink_oidc") === "1"
+      ? [
+          db
+            .prepare(
+              "UPDATE accounts SET oidc_issuer=NULL,oidc_subject=NULL WHERE id=?",
+            )
+            .bind(id),
+        ]
+      : []),
+    ...(removePassword
+      ? [
+          db
+            .prepare("UPDATE accounts SET password_hash=NULL WHERE id=?")
+            .bind(id),
+          db.prepare("DELETE FROM admin_sessions WHERE account_id=?").bind(id),
+        ]
+      : []),
     ...(encoded
       ? [
           db
@@ -2398,6 +2742,7 @@ async function browserPost(
   cookie?: string,
   bootstrapToken?: string,
   captureWithings?: (scale: Row) => Promise<string>,
+  oidcFetch?: typeof fetch,
 ): Promise<Response> {
   const go = (location: string, message = "", replacement = cookie) =>
     redirect(location, message, replacement);
@@ -2491,13 +2836,20 @@ async function browserPost(
     if (!(await adminExists(db))) return go("/setup");
     if (await authLimit(db, request, "login"))
       return go("/login", "Too many attempts; try again in ten minutes");
-    const candidate = await one<{ id: number; password_hash: string | null }>(
+    const candidate = await one<{
+      id: number;
+      role: string;
+      password_hash: string | null;
+    }>(
       db,
-      "SELECT id,password_hash FROM accounts WHERE username=? AND disabled=0",
+      "SELECT id,role,password_hash FROM accounts WHERE username=? AND disabled=0",
       formText(form, "username").trim(),
     );
+    const oidc = await oidcSettings(db);
     if (
       !candidate ||
+      // Administrators always keep the password as a fallback.
+      (candidate.role !== "admin" && oidc.enabled && !oidc.passwordUsers) ||
       !(await passwordMatches(
         formText(form, "password"),
         candidate.password_hash,
@@ -2531,6 +2883,14 @@ async function browserPost(
 
   try {
     if (path === "/account") {
+      if (formText(form, "purpose") === "sync_token_revoke") {
+        await run(
+          db,
+          "UPDATE accounts SET sync_token_hash=NULL WHERE id=?",
+          account.id,
+        );
+        return go("/account", "Sync token revoked");
+      }
       if (formText(form, "purpose") === "username") {
         const username = validUsername(formText(form, "username"));
         if (
@@ -2552,6 +2912,43 @@ async function browserPost(
       }
       await changeOwnPassword(db, account, session, form);
       return go("/account", "Password changed; other sessions were signed out");
+    }
+    if (path === "/oidc") {
+      const enabled = formText(form, "enabled") === "1";
+      const issuerText = formText(form, "issuer").trim();
+      const issuer = issuerText ? normalizeIssuer(issuerText) : "";
+      const clientId = formText(form, "client_id").trim().slice(0, 256);
+      const secret =
+        formText(form, "client_secret") ||
+        (await setting(db, "oidc_client_secret")) ||
+        "";
+      if (enabled) {
+        if (!issuer || !clientId || !secret)
+          throw new Error("OIDC needs an issuer, a client ID and a client secret");
+        await discover(issuer, oidcFetch);
+      }
+      await db.batch([
+        saveSetting(db, "oidc_enabled", enabled ? "1" : "0"),
+        saveSetting(
+          db,
+          "oidc_name",
+          formText(form, "name").trim().slice(0, 40) || "OIDC",
+        ),
+        saveSetting(db, "oidc_issuer", issuer),
+        saveSetting(db, "oidc_client_id", clientId),
+        saveSetting(db, "oidc_client_secret", secret),
+        saveSetting(
+          db,
+          "oidc_auto_create",
+          formText(form, "auto_create") === "1" ? "1" : "0",
+        ),
+        saveSetting(
+          db,
+          "password_login_users",
+          formText(form, "password_users") === "1" ? "1" : "0",
+        ),
+      ]);
+      return go("/admin", "OIDC settings saved");
     }
     if (path === "/accounts" || /^\/accounts\/\d+(\/delete)?$/.test(path))
       return await accountsPost(db, path, form, account, go);
@@ -3118,7 +3515,7 @@ async function browserPost(
       const id = Number(userPath[1]);
       if (
         !(await one(db, "SELECT id FROM users WHERE id=?", id)) ||
-        !canSeeUser(account, id)
+        (account.role !== "admin" && !canSeeUser(account, id))
       )
         return new Response("Not Found", { status: 404 });
       if (account.role !== "admin") {
@@ -3181,7 +3578,7 @@ async function browserPost(
         userId = formInteger(form, "user_id");
       if (
         !(await one(db, "SELECT id FROM users WHERE id=?", userId)) ||
-        !canSeeUser(account, userId)
+        (account.role !== "admin" && !canSeeUser(account, userId))
       )
         throw new Error("Unknown user");
       const [result] = await db.batch([
@@ -3213,7 +3610,7 @@ async function browserPost(
     }
     return new Response("Not Found", { status: 404 });
   } catch (error) {
-    const destination = path.startsWith("/accounts")
+    const destination = path.startsWith("/accounts") || path === "/oidc"
       ? "/admin"
       : path.startsWith("/scales")
       ? "/scales"

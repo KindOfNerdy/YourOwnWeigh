@@ -211,8 +211,12 @@ export function setupPage(
 export function loginPage(
   csrf: string,
   t: Translate = translator("en"),
+  oidc?: { name: string; passwordUsers: boolean },
 ): string {
-  return `<section><h1>${e(t("auth.signIn"))}</h1><form method="post">${hidden(csrf)}<label>${e(t("auth.username"))}<input name="username" required autocomplete="username"></label><label>${e(t("auth.password"))}<input name="password" type="password" required autocomplete="current-password"></label><button>${e(t("auth.signIn"))}</button></form></section>`;
+  const provider = oidc
+    ? `<a class="button" href="/login/oidc">${e(t("auth.signInWith", { name: oidc.name }))}</a>${oidc.passwordUsers ? "" : `<p class="hint">${e(t("auth.passwordAdminsOnly"))}</p>`}`
+    : "";
+  return `<section><h1>${e(t("auth.signIn"))}</h1>${provider}<form method="post">${hidden(csrf)}<label>${e(t("auth.username"))}<input name="username" required autocomplete="username"></label><label>${e(t("auth.password"))}<input name="password" type="password" required autocomplete="current-password"></label><button>${e(t("auth.signIn"))}</button></form></section>`;
 }
 function readingTime(row: Row, language: Language = "en"): string {
   const trusted = row.time_quality === "trusted";
@@ -349,12 +353,23 @@ function userFields(
           : ""
     }`;
 }
+/** Shown once after creating a Sync token; only its hash is stored. */
+export function syncTokenPage(
+  token: string,
+  username: string,
+  language: Language = "en",
+): string {
+  const t = translator(language);
+  return `<section><h1>${e(t("account.syncTokenTitle"))}</h1><p>${e(t("account.syncTokenOnce"))}</p><p><code>${e(token)}</code></p><p class="hint">${e(t("account.syncTokenUse", { name: username }))}</p><a class="button" href="/account">${e(t("common.continue"))}</a></section>
+`;
+}
 /** The signed-in account: its password and the profiles of its people. */
 export function accountPage(
   account: { username: string; role: string },
   people: Row[],
   csrf: string,
   language: Language = "en",
+  hasSyncToken = false,
 ): string {
   const t = translator(language);
   const T = (key: MessageKey) => e(t(key));
@@ -367,6 +382,12 @@ export function accountPage(
       <label>${T("account.newPassword")}<input name="new" type="password" minlength="8" required autocomplete="new-password"></label>
       <label>${T("account.confirmPassword")}<input name="confirm" type="password" minlength="8" required autocomplete="new-password"></label>
       <button>${T("users.save")}</button></form></section>
+    <section><h2>${T("account.syncToken")}</h2><p>${T("account.syncTokenIntro")}</p>
+      <form action="/account" method="post">${hidden(csrf)}<input type="hidden" name="purpose" value="sync_token"><button>${T(hasSyncToken ? "account.syncTokenRenew" : "account.syncTokenCreate")}</button></form>${
+        hasSyncToken
+          ? `<form action="/account" method="post">${hidden(csrf)}<input type="hidden" name="purpose" value="sync_token_revoke"><button class="secondary">${T("account.syncTokenRevoke")}</button></form>`
+          : ""
+      }</section>
     <section><h2>${T("account.people")}</h2>${
       people.length
         ? `<p class="hint">${T("account.profileHint")}</p><ul>${people.map((u) => `<li>${e(u.name)} <button type="button" class="secondary" data-open-dialog="edit-user-${e(u.id)}">${T("common.edit")}</button></li>`).join("")}</ul>`

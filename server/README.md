@@ -105,7 +105,7 @@ Import uploads to bounded temporary staging (10 MiB / 25,000 rows), shows counts
 
 Backup import validates device models against the shared model registry, including WS-50 (`WBS02`). Earlier `WS50` device exports, backups and database records are normalised to `WBS02`. Merge and Replace retain linked readings and raw metrics; unknown model identifiers are rejected.
 
-The Sync API uses HTTP Basic. An account logs in with its own username and password and only reaches the people linked to it (administrators reach everyone). The legacy name `reader` keeps household-wide access with the Sync API password, or with an administrator's password while the Sync API is shared. It accepts a numeric user ID or unique three-letter name. See Sync in the app and [Apple Health](../connectors/Apple%20Health/README.md). Unknown users, people outside the account's scope and errors return JSON.
+The Sync API uses HTTP Basic. An account logs in with its own username and password and only reaches the people linked to it (administrators reach everyone). The legacy name `reader` keeps household-wide access with the Sync API password, or with an administrator's password while the Sync API is shared. It accepts a numeric user ID or unique three-letter name. See Sync in the app and [Apple Health](../connectors/Apple%20Health/README.md). Accounts without a password create a Sync token under Account and use it as the password. Unknown users, people outside the account's scope and errors return JSON.
 
 Use [`/api/users/USER/readings`](../contracts/readings/v1/README.md) for all metrics
 and raw groups. `/weights` and the Apple Health Shortcut remain weight-only.
