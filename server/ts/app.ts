@@ -442,7 +442,11 @@ async function oidcAccount(
     if (known.disabled) throw new Error("This account is disabled");
     return known.id;
   }
-  const names = [claims.preferred_username, claims.email]
+  // An e-mail address only counts when the provider vouches for it.
+  const names = [
+    claims.preferred_username,
+    claims.email_verified === true ? claims.email : undefined,
+  ]
     .filter((value): value is string => typeof value === "string" && !!value)
     .map((value) => value.toLowerCase());
   for (const name of names) {
@@ -557,11 +561,15 @@ async function oidcRoute(
         "DELETE FROM oidc_logins WHERE state_hash=?",
         await digest(state),
       );
+    // RFC 9207: a response that names another issuer is not for this login.
+    const responseIssuer = url.searchParams.get("iss");
     if (
       !login ||
       !code ||
       url.searchParams.has("error") ||
-      !equal(cookie, state)
+      !equal(cookie, state) ||
+      (responseIssuer !== null &&
+        responseIssuer.replace(/\/+$/, "") !== settings.config.issuer)
     ) {
       await authLimit(db, request, "login", true);
       return fail("OIDC sign-in failed; start again");

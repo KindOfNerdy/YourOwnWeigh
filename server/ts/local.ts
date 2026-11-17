@@ -170,7 +170,13 @@ export function localListener(
       const responseHeaders = new Headers(response.headers);
       if (secure)
         responseHeaders.set("Strict-Transport-Security", "max-age=31536000");
-      outgoing.writeHead(response.status, Object.fromEntries(responseHeaders));
+      // Several Set-Cookie headers must stay separate; a plain object keeps one.
+      const out: Record<string, string | string[]> = Object.fromEntries(
+        [...responseHeaders].filter(([name]) => name !== "set-cookie"),
+      );
+      const cookies = response.headers.getSetCookie();
+      if (cookies.length) out["set-cookie"] = cookies;
+      outgoing.writeHead(response.status, out);
       outgoing.end(Buffer.from(await response.arrayBuffer()));
     } catch (error) {
       console.error(

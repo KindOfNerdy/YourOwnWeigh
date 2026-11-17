@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { handleApp, type AppEnv } from "../app.ts";
+import { localListener } from "../local.ts";
 import { adminBrowser, browser, household, location, ORIGIN, PASSWORD } from "./helpers_accounts.ts";
 
 const ISSUER = "https://id.test";
@@ -15,26 +18,35 @@ function provider() {
   const rsa = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const other = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const ec = generateKeyPairSync("ec", { namedCurve: "P-256" });
+  const ec384 = generateKeyPairSync("ec", { namedCurve: "P-384" });
+  const ed = generateKeyPairSync("ed25519");
   const keys = [
     { ...rsa.publicKey.export({ format: "jwk" }), kid: "rsa1", use: "sig" },
     { ...ec.publicKey.export({ format: "jwk" }), kid: "ec1", use: "sig" },
+    { ...ec384.publicKey.export({ format: "jwk" }), kid: "ec384", use: "sig" },
+    { ...ed.publicKey.export({ format: "jwk" }), kid: "ed1", use: "sig" },
   ];
   const pending = { nonce: "", challenge: "" };
   const idp = {
     /** What the next token carries; tests change it before the callback. */
     claims: {} as Record<string, unknown>,
     alg: "RS256" as string,
-    signWith: "rsa" as "rsa" | "ec" | "other",
+    signWith: "rsa" as "rsa" | "ec" | "ec384" | "ed" | "other",
     rejectToken: false,
     mint(claims: Record<string, unknown>) {
-      const kid = idp.signWith === "ec" ? "ec1" : "rsa1";
+      const kid = { ec: "ec1", ec384: "ec384", ed: "ed1" }[idp.signWith as string] ?? "rsa1";
       const head = b64({ alg: idp.alg, kid, typ: "JWT" });
-      const data = `${head}.${b64(claims)}`;
+      const data = Buffer.from(`${head}.${b64(claims)}`);
+      const hash = idp.alg.endsWith("384") ? "sha384" : idp.alg.endsWith("512") ? "sha512" : "sha256";
       const signature =
         idp.signWith === "ec"
-          ? sign("sha256", Buffer.from(data), { key: ec.privateKey, dsaEncoding: "ieee-p1363" })
-          : sign("sha256", Buffer.from(data), idp.signWith === "other" ? other.privateKey : rsa.privateKey);
-      return `${data}.${signature.toString("base64url")}`;
+          ? sign("sha256", data, { key: ec.privateKey, dsaEncoding: "ieee-p1363" })
+          : idp.signWith === "ec384"
+            ? sign("sha384", data, { key: ec384.privateKey, dsaEncoding: "ieee-p1363" })
+            : idp.signWith === "ed"
+              ? sign(null, data, ed.privateKey)
+              : sign(hash, data, idp.signWith === "other" ? other.privateKey : rsa.privateKey);
+      return `${data.toString()}.${signature.toString("base64url")}`;
     },
     fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
@@ -102,7 +114,7 @@ async function setup() {
 }
 
 /** The browser round trip: start, authenticate at the provider, come back. */
-async function oidcLogin(env: AppEnv, idp: ReturnType<typeof provider>, tweak: { state?: string; cookie?: string | null } = {}) {
+async function oidcLogin(env: AppEnv, idp: ReturnType<typeof provider>, tweak: { state?: string; cookie?: string | null; iss?: string } = {}) {
   const start = await handleApp(new Request(`${ORIGIN}/login/oidc`), env);
   assert.equal(start.status, 303);
   const authorize = new URL(start.headers.get("location")!);
@@ -110,7 +122,7 @@ async function oidcLogin(env: AppEnv, idp: ReturnType<typeof provider>, tweak: {
   const state = authorize.searchParams.get("state")!;
   const cookie = tweak.cookie === undefined ? state : tweak.cookie;
   const callback = await handleApp(
-    new Request(`${ORIGIN}/login/oidc/callback?code=abc&state=${tweak.state ?? state}`, {
+    new Request(`${ORIGIN}/login/oidc/callback?code=abc&state=${tweak.state ?? state}${tweak.iss ? `&iss=${encodeURIComponent(tweak.iss)}` : ""}`, {
       headers: cookie ? { Cookie: `yow_oidc=${cookie}` } : {},
     }),
     env,
@@ -214,6 +226,7 @@ test("a login is refused when the token, the state or the browser does not match
       ["no state cookie", async () => oidcLogin(h.env, idp, { cookie: null })],
       ["state cookie of another login", async () => oidcLogin(h.env, idp, { cookie: "a".repeat(48) })],
       ["token request refused", async () => { idp.rejectToken = true; return oidcLogin(h.env, idp); }],
+      ["response from another issuer", async () => oidcLogin(h.env, idp, { iss: "https://evil.test" })],
     ];
     for (const [name, run] of cases) {
       idp.reset();
@@ -235,13 +248,27 @@ test("a login is refused when the token, the state or the browser does not match
   }
 });
 
-test("ES256 tokens are accepted", async () => {
+test("the common ID token signature algorithms are accepted", async () => {
   const { h, idp, admin } = await setup();
   try {
     await admin.post("/accounts", { username: "jane", password: "", role: "user", oidc_username: "jane" }, "/admin");
-    idp.alg = "ES256";
-    idp.signWith = "ec";
-    assert.equal(await signedIn(h.env, (await oidcLogin(h.env, idp)).session), true);
+    const variants: Array<[string, typeof idp.signWith]> = [
+      ["RS256", "rsa"], ["RS384", "rsa"], ["RS512", "rsa"],
+      ["ES256", "ec"], ["ES384", "ec384"], ["EdDSA", "ed"],
+    ];
+    for (const [alg, signWith] of variants) {
+      idp.reset();
+      idp.alg = alg;
+      idp.signWith = signWith;
+      assert.equal(await signedIn(h.env, (await oidcLogin(h.env, idp)).session), true, alg);
+    }
+    // Names that are not algorithms, and a key of the wrong family, are refused.
+    for (const [alg, signWith] of [["constructor", "rsa"], ["HS256", "rsa"], ["ES256", "rsa"]] as const) {
+      idp.reset();
+      idp.alg = alg;
+      idp.signWith = signWith;
+      assert.equal((await oidcLogin(h.env, idp)).session, undefined, alg);
+    }
   } finally {
     h.close();
   }
@@ -396,5 +423,55 @@ test("a backup keeps the OIDC settings, the account bindings and the see-all cho
   } finally {
     h.close();
     target.close();
+  }
+});
+
+test("through the real HTTP server both cookies of the callback arrive and the session works", async () => {
+  const { h, idp, admin } = await setup();
+  const hosts = new Set<string>();
+  const server = createServer(localListener(h.env, false, hosts));
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    await admin.post("/accounts", { username: "jane", password: "", role: "user", oidc_username: "jane" }, "/admin");
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    hosts.add(base.slice("http://".length));
+    const start = await fetch(`${base}/login/oidc`, { redirect: "manual" });
+    assert.equal(start.status, 303);
+    const authorize = new URL(start.headers.get("location")!);
+    idp.remember(authorize);
+    const state = authorize.searchParams.get("state")!;
+    assert.match(start.headers.getSetCookie().join("\n"), new RegExp(`yow_oidc=${state}`));
+    const callback = await fetch(`${base}/login/oidc/callback?code=abc&state=${state}`, {
+      redirect: "manual",
+      headers: { Cookie: `yow_oidc=${state}` },
+    });
+    assert.equal(callback.status, 200);
+    const cookies = callback.headers.getSetCookie();
+    assert.equal(cookies.length, 2, cookies.join(" | "));
+    const session = cookies.find((c) => c.startsWith("yow_session="))!;
+    assert.match(session, /Path=\/;/);
+    assert.match(session, /Max-Age=604800/);
+    assert.ok(cookies.some((c) => c.startsWith("yow_oidc=;") && /Max-Age=0/.test(c)));
+    const home = await fetch(`${base}/`, { headers: { Cookie: session.split(";")[0] }, redirect: "manual" });
+    assert.equal(home.status, 200);
+    assert.match(await home.text(), /Jane/);
+  } finally {
+    server.close();
+    h.close();
+  }
+});
+
+test("an e-mail address only pre-provisions an account when the provider verified it; the issuer parameter may match", async () => {
+  const { h, idp, admin } = await setup();
+  try {
+    await admin.post("/accounts", { username: "jane", password: "", role: "user", oidc_username: "jane@example.org" }, "/admin");
+    idp.claims = { preferred_username: "somebody", email: "jane@example.org", email_verified: false };
+    assert.equal((await oidcLogin(h.env, idp)).session, undefined);
+    idp.claims = { preferred_username: "somebody", email: "jane@example.org" };
+    assert.equal((await oidcLogin(h.env, idp)).session, undefined);
+    idp.claims = { preferred_username: "somebody", email: "jane@example.org", email_verified: true };
+    assert.equal(await signedIn(h.env, (await oidcLogin(h.env, idp, { iss: `${ISSUER}/` })).session), true);
+  } finally {
+    h.close();
   }
 });
