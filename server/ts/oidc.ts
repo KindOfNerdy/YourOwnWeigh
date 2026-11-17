@@ -21,6 +21,7 @@ export type Claims = {
   azp?: string;
   preferred_username?: string;
   email?: string;
+  email_verified?: boolean;
   name?: string;
 };
 
@@ -144,36 +145,37 @@ export async function exchangeCode(
 }
 
 type Jwk = JsonWebKey & { kid?: string; use?: string; alg?: string };
+type Scheme = {
+  kty: string;
+  crv?: string;
+  importAlgorithm: AlgorithmIdentifier | RsaHashedImportParams | EcKeyImportParams;
+  verifyAlgorithm: AlgorithmIdentifier | EcdsaParams;
+};
+/** The ID token signature algorithms accepted, with their WebCrypto parameters. */
+const SCHEMES: Record<string, Scheme> = {
+  RS256: { kty: "RSA", importAlgorithm: { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, verifyAlgorithm: "RSASSA-PKCS1-v1_5" },
+  RS384: { kty: "RSA", importAlgorithm: { name: "RSASSA-PKCS1-v1_5", hash: "SHA-384" }, verifyAlgorithm: "RSASSA-PKCS1-v1_5" },
+  RS512: { kty: "RSA", importAlgorithm: { name: "RSASSA-PKCS1-v1_5", hash: "SHA-512" }, verifyAlgorithm: "RSASSA-PKCS1-v1_5" },
+  ES256: { kty: "EC", crv: "P-256", importAlgorithm: { name: "ECDSA", namedCurve: "P-256" }, verifyAlgorithm: { name: "ECDSA", hash: "SHA-256" } },
+  ES384: { kty: "EC", crv: "P-384", importAlgorithm: { name: "ECDSA", namedCurve: "P-384" }, verifyAlgorithm: { name: "ECDSA", hash: "SHA-384" } },
+  ES512: { kty: "EC", crv: "P-521", importAlgorithm: { name: "ECDSA", namedCurve: "P-521" }, verifyAlgorithm: { name: "ECDSA", hash: "SHA-512" } },
+  EdDSA: { kty: "OKP", crv: "Ed25519", importAlgorithm: { name: "Ed25519" }, verifyAlgorithm: { name: "Ed25519" } },
+};
 async function verifySignature(
-  alg: string,
+  scheme: Scheme,
   jwk: Jwk,
   signature: Uint8Array<ArrayBuffer>,
   data: Uint8Array<ArrayBuffer>,
 ): Promise<boolean> {
   try {
-    if (alg === "RS256") {
-      const key = await crypto.subtle.importKey(
-        "jwk",
-        jwk,
-        { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-        false,
-        ["verify"],
-      );
-      return crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, signature, data);
-    }
     const key = await crypto.subtle.importKey(
       "jwk",
       jwk,
-      { name: "ECDSA", namedCurve: "P-256" },
+      scheme.importAlgorithm,
       false,
       ["verify"],
     );
-    return crypto.subtle.verify(
-      { name: "ECDSA", hash: "SHA-256" },
-      key,
-      signature,
-      data,
-    );
+    return await crypto.subtle.verify(scheme.verifyAlgorithm, key, signature, data);
   } catch {
     return false;
   }
@@ -198,18 +200,21 @@ export async function verifyIdToken(
   } catch {
     throw new Error("Invalid ID token");
   }
-  if (header.alg !== "RS256" && header.alg !== "ES256")
-    throw new Error("Unsupported ID token algorithm");
+  const scheme =
+    header.alg && Object.hasOwn(SCHEMES, header.alg)
+      ? SCHEMES[header.alg]
+      : undefined;
+  if (!scheme) throw new Error("Unsupported ID token algorithm");
   const response = await fetchImpl(d.jwks_uri, {
     signal: AbortSignal.timeout(10000),
     redirect: "error",
   });
   if (!response.ok) throw new Error("OIDC key request failed");
   const keys = ((await response.json()) as { keys?: Jwk[] }).keys ?? [];
-  const wanted = header.alg === "RS256" ? "RSA" : "EC";
   const candidates = keys.filter(
     (key) =>
-      key.kty === wanted &&
+      key.kty === scheme.kty &&
+      (scheme.crv === undefined || key.crv === scheme.crv) &&
       (key.use === undefined || key.use === "sig") &&
       (!header.kid || key.kid === header.kid),
   );
@@ -217,7 +222,7 @@ export async function verifyIdToken(
   const signature = fromB64u(sig);
   let valid = false;
   for (const key of candidates)
-    if (await verifySignature(header.alg, key, signature, data)) {
+    if (await verifySignature(scheme, key, signature, data)) {
       valid = true;
       break;
     }
