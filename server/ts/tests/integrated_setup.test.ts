@@ -93,7 +93,8 @@ test("two-stage bootstrap, integrated navigation, automatic model-safe enrollmen
     );
     const dashboard = await page("/");
     assert.match(dashboard, /Add Your First Scale/);
-    assert.doesNotMatch(dashboard, />Admin<|Device Config/);
+    assert.doesNotMatch(dashboard, /Device Config/);
+    assert.match(dashboard, /<a href="\/admin">Admin<\/a>/);
     const scales = await page("/scales");
     assert.match(scales, /<h1>Scales<\/h1>/);
     assert.doesNotMatch(scales, /firmware-workspace/);

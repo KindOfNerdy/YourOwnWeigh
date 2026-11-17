@@ -1838,8 +1838,8 @@ export async function handleApp(
             )
             .join(
               "",
-            )}</dl><form action="/api/backup/commit" method="post"><input type="hidden" name="_csrf" value="${csrf}"><input type="hidden" name="import_id" value="${staged.id}"><input type="hidden" name="digest" value="${staged.digest}"><label><input type="radio" name="mode" value="merge" checked> ${T("backup.merge")}</label><label><input type="radio" name="mode" value="replace"> ${T("backup.replace")}</label><p>${T("backup.replaceHint")} <a href="/api/backup/export">${T("backup.exportFirst")}</a>.</p>${staged.hasAccess ? `<label><input type="checkbox" name="restore_access" value="1"> ${T("backup.restoreAccess")}</label>` : ""}<label><input type="checkbox" name="confirmed" value="1" required> ${T("backup.confirmed")}</label><div class="dialog-actions"><button>${T("backup.importButton")}</button><a href="/settings">${T("common.cancel")}</a></div></form></section>`,
-          "/settings",
+            )}</dl><form action="/api/backup/commit" method="post"><input type="hidden" name="_csrf" value="${csrf}"><input type="hidden" name="import_id" value="${staged.id}"><input type="hidden" name="digest" value="${staged.digest}"><label><input type="radio" name="mode" value="merge" checked> ${T("backup.merge")}</label><label><input type="radio" name="mode" value="replace"> ${T("backup.replace")}</label><p>${T("backup.replaceHint")} <a href="/api/backup/export">${T("backup.exportFirst")}</a>.</p>${staged.hasAccess ? `<label><input type="checkbox" name="restore_access" value="1"> ${T("backup.restoreAccess")}</label>` : ""}<label><input type="checkbox" name="confirmed" value="1" required> ${T("backup.confirmed")}</label><div class="dialog-actions"><button>${T("backup.importButton")}</button><a href="/admin">${T("common.cancel")}</a></div></form></section>`,
+          "/admin",
         );
       }
       if (path === "/api/backup/commit") {
@@ -1860,7 +1860,7 @@ export async function handleApp(
             browser.token_hash,
           );
         return go(
-          restore ? "/login" : "/settings",
+          restore ? "/login" : "/admin",
           restore
             ? "Backup restored. Sign in with the backup’s admin password."
             : "Backup imported. Current passwords retained.",
@@ -1869,8 +1869,8 @@ export async function handleApp(
     } catch (error) {
       return page(
         t("backup.failedTitle"),
-        `<section><h1>${escapeHtml(t("backup.failedTitle"))}</h1><p>${escapeHtml(translateMessage(safeError(error), language))}</p><a href="/settings">${escapeHtml(t("backup.backToSettings"))}</a></section>`,
-        "/settings",
+        `<section><h1>${escapeHtml(t("backup.failedTitle"))}</h1><p>${escapeHtml(translateMessage(safeError(error), language))}</p><a href="/admin">${escapeHtml(t("backup.backToSettings"))}</a></section>`,
+        "/admin",
       );
     }
     return json({ error: "Not found" }, 404);
@@ -1912,6 +1912,32 @@ export async function handleApp(
     !/^\/users\/\d+\/readings$/.test(path)
   )
     return go("/", "Administrator access required");
+  if (path === "/admin")
+    return page(
+      t("nav.admin"),
+      `<section class="page-heading"><h1>${escapeHtml(t("nav.admin"))}</h1></section>` +
+        settingsWorkspace(
+          csrf,
+          (await setting(db, "display_weight_unit")) ?? "kg",
+          (await setting(db, "sync_password_mode")) === "separate" ||
+            ((await setting(db, "sync_password_mode")) === null &&
+              !!(await setting(db, "api_password"))),
+          languagePreference,
+          language,
+        ) +
+        accountsSection(
+          csrf,
+          await rows(
+            db,
+            "SELECT id,username,role,disabled FROM accounts ORDER BY username",
+          ),
+          await accountLinks(db),
+          await rows(db, "SELECT id,name FROM users ORDER BY name,id"),
+          account.id,
+          language,
+        ),
+      "/admin",
+    );
   if (path === "/account")
     return page(
       t("nav.account"),
@@ -2189,32 +2215,7 @@ export async function handleApp(
       ),
       "/sync",
     );
-  if (path === "/preferences" || path === "/settings") {
-    const mode = await setting(db, "sync_password_mode");
-    return page(
-      t("nav.settings"),
-      settingsWorkspace(
-        csrf,
-        (await setting(db, "display_weight_unit")) ?? "kg",
-        mode === "separate" ||
-          (mode === null && !!(await setting(db, "api_password"))),
-        languagePreference,
-        language,
-      ) +
-        accountsSection(
-          csrf,
-          await rows(
-            db,
-            "SELECT id,username,role,disabled FROM accounts ORDER BY username",
-          ),
-          await accountLinks(db),
-          await rows(db, "SELECT id,name FROM users ORDER BY name,id"),
-          account.id,
-          language,
-        ),
-      "/settings",
-    );
-  }
+  if (path === "/preferences" || path === "/settings") return go("/admin");
   return new Response("Not Found", { status: 404 });
 }
 
@@ -2331,7 +2332,7 @@ async function accountsPost(
       ).map((row) => row.id);
     if (people.length) await db.batch(linkPeople(db, created.id, people));
     return go(
-      "/settings",
+      "/admin",
       role === "user" && !people.length
         ? "Account saved. No person matches the username yet; link people by editing the account."
         : "Account created",
@@ -2354,7 +2355,7 @@ async function accountsPost(
       db.prepare("DELETE FROM admin_sessions WHERE account_id=?").bind(id),
       db.prepare("DELETE FROM accounts WHERE id=?").bind(id),
     ]);
-    return go("/settings", "Account deleted");
+    return go("/admin", "Account deleted");
   }
   const role = own
     ? target.role
@@ -2370,20 +2371,10 @@ async function accountsPost(
     throw new Error("There must be at least one active administrator");
   const password = formText(form, "password");
   const encoded = password ? await passwordHash(password) : null;
-  const username = validUsername(
-    formText(form, "username") ||
-      (await one<{ username: string }>(
-        db,
-        "SELECT username FROM accounts WHERE id=?",
-        id,
-      ))!.username,
-  );
-  if (await one(db, "SELECT id FROM accounts WHERE username=? AND id<>?", username, id))
-    throw new Error("Username is already taken");
   await db.batch([
     db
-      .prepare("UPDATE accounts SET username=?,role=?,disabled=? WHERE id=?")
-      .bind(username, role, disabled, id),
+      .prepare("UPDATE accounts SET role=?,disabled=? WHERE id=?")
+      .bind(role, disabled, id),
     ...(encoded
       ? [
           db
@@ -2395,7 +2386,7 @@ async function accountsPost(
     db.prepare("DELETE FROM account_users WHERE account_id=?").bind(id),
     ...linkPeople(db, id, await existingPeople(db, form)),
   ]);
-  return go("/settings", "Account saved");
+  return go("/admin", "Account saved");
 }
 async function browserPost(
   request: Request,
@@ -2540,6 +2531,25 @@ async function browserPost(
 
   try {
     if (path === "/account") {
+      if (formText(form, "purpose") === "username") {
+        const username = validUsername(formText(form, "username"));
+        if (
+          await one(
+            db,
+            "SELECT id FROM accounts WHERE username=? AND id<>?",
+            username,
+            account.id,
+          )
+        )
+          throw new Error("Username is already taken");
+        await run(
+          db,
+          "UPDATE accounts SET username=? WHERE id=?",
+          username,
+          account.id,
+        );
+        return go("/account", "Username changed");
+      }
       await changeOwnPassword(db, account, session, form);
       return go("/account", "Password changed; other sessions were signed out");
     }
@@ -2573,7 +2583,7 @@ async function browserPost(
             : db.prepare("DELETE FROM settings WHERE key='api_password'"),
         ]);
         return go(
-          "/settings",
+          "/admin",
           separate
             ? "Separate Sync API password saved"
             : "Sync API now uses the admin password",
@@ -2584,7 +2594,7 @@ async function browserPost(
       if (purpose === "admin_password") {
         await changeOwnPassword(db, account, session, form);
         return go(
-          "/settings",
+          "/account",
           "Admin password changed; other sessions were signed out",
         );
       }
@@ -2603,7 +2613,7 @@ async function browserPost(
         saveSetting(db, "api_password", encoded),
         saveSetting(db, "sync_password_mode", "separate"),
       ]);
-      return go("/settings", "Readings API password set");
+      return go("/admin", "Readings API password set");
     }
     if (path === "/preferences") {
       const unit = formText(form, "weight_unit");
@@ -2618,7 +2628,7 @@ async function browserPost(
         saveSetting(db, "display_weight_unit", unit),
         saveSetting(db, "display_language", preference),
       ]);
-      return go("/settings", "Display settings saved");
+      return go("/admin", "Display settings saved");
     }
     if (path === "/scales") {
       const label = formText(form, "label").trim();
@@ -3204,7 +3214,7 @@ async function browserPost(
     return new Response("Not Found", { status: 404 });
   } catch (error) {
     const destination = path.startsWith("/accounts")
-      ? "/settings"
+      ? "/admin"
       : path.startsWith("/scales")
       ? "/scales"
       : path.startsWith("/users")

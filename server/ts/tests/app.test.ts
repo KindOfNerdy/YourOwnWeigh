@@ -64,7 +64,7 @@ test("one TypeScript app serves dashboard, readings API and scale sync with SQLi
     assert.equal(dashboard.status, 200);
     csrf = /name="_csrf" value="([a-f0-9]+)"/.exec(await dashboard.text())![1];
     assert.match(
-      await (await request("/settings")).text(),
+      await (await request("/admin")).text(),
       /Sync API Password/,
     );
     assert.equal(
@@ -152,7 +152,7 @@ test("one TypeScript app serves dashboard, readings API and scale sync with SQLi
     );
     assert.match(await (await request("/users")).text(), /Sam/);
     assert.match(
-      await (await request("/settings")).text(),
+      await (await request("/admin")).text(),
       /Sync API Password/,
     );
 
@@ -949,7 +949,7 @@ test("portable PBKDF2 hash logs in and admin rotation invalidates other sessions
     const first = await login(),
       second = await login();
     const page = await handleApp(
-      new Request("https://local.test/settings", {
+      new Request("https://local.test/admin", {
         headers: { Cookie: first.cookie },
       }),
       env,

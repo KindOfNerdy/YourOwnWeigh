@@ -184,7 +184,7 @@ test("dashboard and settings follow the browser or the saved language", async ()
     assert.match(german, />Abmelden</);
     assert.match(german, /Es wurden noch keine Personen angelegt\./);
 
-    const settings = await (await request("/settings", "de")).text();
+    const settings = await (await request("/admin", "de")).text();
     assert.match(settings, /<h2>Anzeige<\/h2>/);
     assert.match(
       settings,
