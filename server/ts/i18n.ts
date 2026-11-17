@@ -188,6 +188,7 @@ const en = {
   "users.fetch": "Fetch From Withings",
   "users.importUnavailable": "Withings import is unavailable on this server.",
   "users.save": "Save User",
+  "common.save": "Save",
   "users.edit": "Edit {name}",
   "users.retire": "Retire User",
   "users.delete": "Delete User",
@@ -949,6 +950,7 @@ const de: Record<MessageKey, string> = {
   "users.importUnavailable":
     "Der Withings-Import ist auf diesem Server nicht verfügbar.",
   "users.save": "Person speichern",
+  "common.save": "Speichern",
   "users.edit": "{name} bearbeiten",
   "users.retire": "Person deaktivieren",
   "users.delete": "Person löschen",
