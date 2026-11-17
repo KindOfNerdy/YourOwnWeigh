@@ -250,7 +250,7 @@ export function accountsSection(
       <label>${T("auth.password")}<input name="password" type="password" minlength="8"${oidcEnabled ? "" : " required"} autocomplete="new-password"></label>
       ${oidcName("")}${oidcEnabled ? `<p class="hint">${T("accounts.passwordOptionalHint")}</p>` : ""}
       ${roleSelect("user")}${seeAll(true)}${checkboxes(new Set())}<p class="hint">${T("accounts.matchHint")}</p>
-      <div class="dialog-actions"><button>${T("users.save")}</button></div></form></dialog>
+      <div class="dialog-actions"><button>${T("common.save")}</button></div></form></dialog>
     ${accounts
       .map((a) => {
         const self = Number(a.id) === selfId;
@@ -261,7 +261,7 @@ export function accountsSection(
       ${oidcEnabled && a.oidc_linked ? `<label><input type="checkbox" name="unlink_oidc" value="1"> ${T("accounts.unlinkOidc")}</label>` : ""}
       <label>${T("accounts.resetPassword")}<input name="password" type="password" minlength="8" autocomplete="new-password"></label>
       ${oidcEnabled && a.has_password ? `<label><input type="checkbox" name="remove_password" value="1"> ${T("accounts.removePassword")}</label>` : ""}
-      <div class="dialog-actions"><button>${T("users.save")}</button></div></form>
+      <div class="dialog-actions"><button>${T("common.save")}</button></div></form>
       ${self ? "" : `<div class="dialog-actions"><form action="/accounts/${e(a.id)}/delete" method="post" data-confirm="${T("accounts.confirmDelete")}">${hidden(csrf)}<button class="danger">${T("accounts.delete")}</button></form></div>`}</dialog>`;
       })
       .join("")}</section>`;
@@ -296,5 +296,5 @@ export function oidcSection(
       ${box("auto_create", o.autoCreate, "oidc.autoCreate")}
       ${box("password_users", o.passwordUsers, "oidc.passwordUsers")}
       <p class="hint">${T("oidc.redirectUri")} <code>${e(redirectUri)}</code></p>
-      <button>${T("users.save")}</button></form></section>`;
+      <button>${T("common.save")}</button></form></section>`;
 }
