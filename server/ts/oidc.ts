@@ -10,6 +10,7 @@ export type Discovery = {
   authorization_endpoint: string;
   token_endpoint: string;
   jwks_uri: string;
+  userinfo_endpoint?: string;
 };
 export type Claims = {
   iss: string;
@@ -23,6 +24,7 @@ export type Claims = {
   email?: string;
   email_verified?: boolean;
   name?: string;
+  [claim: string]: unknown;
 };
 
 const utf8 = new TextEncoder();
@@ -82,6 +84,9 @@ export async function discover(
     ),
     token_endpoint: endpoint(doc.token_endpoint, "token endpoint"),
     jwks_uri: endpoint(doc.jwks_uri, "JWKS URI"),
+    ...(doc.userinfo_endpoint
+      ? { userinfo_endpoint: endpoint(doc.userinfo_endpoint, "UserInfo endpoint") }
+      : {}),
   };
 }
 export async function pkce(): Promise<{ verifier: string; challenge: string }> {
@@ -100,13 +105,14 @@ export function authorizationUrl(
   state: string,
   nonce: string,
   challenge: string,
+  scope = "openid profile email",
 ): string {
   const url = new URL(d.authorization_endpoint);
   for (const [key, value] of Object.entries({
     response_type: "code",
     client_id: config.clientId,
     redirect_uri: redirectUri,
-    scope: "openid profile email",
+    scope,
     state,
     nonce,
     code_challenge: challenge,
@@ -122,7 +128,7 @@ export async function exchangeCode(
   code: string,
   verifier: string,
   fetchImpl: FetchLike = fetch,
-): Promise<string> {
+): Promise<{ idToken: string; accessToken?: string }> {
   const response = await fetchImpl(d.token_endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -138,10 +144,52 @@ export async function exchangeCode(
     redirect: "error",
   });
   if (!response.ok) throw new Error("OIDC token request failed");
-  const body = (await response.json()) as { id_token?: unknown };
+  const body = (await response.json()) as {
+    id_token?: unknown;
+    access_token?: unknown;
+  };
   if (typeof body.id_token !== "string")
     throw new Error("OIDC provider returned no ID token");
-  return body.id_token;
+  return {
+    idToken: body.id_token,
+    ...(typeof body.access_token === "string"
+      ? { accessToken: body.access_token }
+      : {}),
+  };
+}
+/** Claims from the UserInfo endpoint; its `sub` must be the ID token's subject. */
+export async function fetchUserinfo(
+  d: Discovery,
+  accessToken: string,
+  subject: string,
+  fetchImpl: FetchLike = fetch,
+): Promise<Record<string, unknown>> {
+  if (!d.userinfo_endpoint) return {};
+  const response = await fetchImpl(d.userinfo_endpoint, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    signal: AbortSignal.timeout(10000),
+    redirect: "error",
+  });
+  if (!response.ok) return {};
+  const info = (await response.json()) as Record<string, unknown>;
+  if (info.sub !== subject) throw new Error("UserInfo does not match the ID token");
+  return info;
+}
+/**
+ * The values of a groups claim: a list of strings, or one string separated by
+ * spaces or commas. Returns null when the claim is absent, so that a missing
+ * claim is never mistaken for "member of no group".
+ */
+export function groupsOf(
+  claims: Record<string, unknown>,
+  name: string,
+): string[] | null {
+  const value = claims[name];
+  if (Array.isArray(value))
+    return value.filter((item): item is string => typeof item === "string");
+  if (typeof value === "string")
+    return value.split(/[\s,]+/).filter(Boolean);
+  return null;
 }
 
 type Jwk = JsonWebKey & { kid?: string; use?: string; alg?: string };

@@ -10,6 +10,8 @@ import {
   authorizationUrl,
   discover,
   exchangeCode,
+  fetchUserinfo,
+  groupsOf,
   normalizeIssuer,
   pkce,
   verifyIdToken,
@@ -386,6 +388,10 @@ type OidcSettings = {
   autoCreate: boolean;
   /** Whether accounts with the role "user" may still sign in with a password. */
   passwordUsers: boolean;
+  /** Members of this group are administrators; empty means roles are not synced. */
+  adminGroup: string;
+  groupsClaim: string;
+  scopes: string;
   config: OidcConfig | null;
 };
 async function oidcSettings(db: D1Database): Promise<OidcSettings> {
@@ -405,6 +411,9 @@ async function oidcSettings(db: D1Database): Promise<OidcSettings> {
     hasSecret: !!secret,
     autoCreate: (await setting(db, "oidc_auto_create")) === "1",
     passwordUsers: (await setting(db, "password_login_users")) !== "0",
+    adminGroup: (await setting(db, "oidc_admin_group")) ?? "",
+    groupsClaim: (await setting(db, "oidc_groups_claim")) || "groups",
+    scopes: (await setting(db, "oidc_scopes")) || "openid profile email",
     config: enabled ? { issuer, clientId, clientSecret: secret } : null,
   };
 }
@@ -417,6 +426,13 @@ const peopleByName = async (db: D1Database, name: string): Promise<number[]> =>
       name,
     )
   ).map((row) => row.id);
+/** The scopes to request; the groups scope is added when a group decides the role. */
+const oidcScope = (settings: OidcSettings): string => {
+  const scopes = settings.scopes.split(/\s+/).filter(Boolean);
+  if (settings.adminGroup && !scopes.includes(settings.groupsClaim))
+    scopes.push(settings.groupsClaim);
+  return scopes.join(" ");
+};
 const oidcCookie = (value: string, maxAge: number, secure: boolean) =>
   `yow_oidc=${value}; HttpOnly; ${secure ? "Secure; " : ""}SameSite=Lax; Path=/login/oidc; Max-Age=${maxAge}`;
 /** The account an OIDC identity signs in as: known subject, pre-provisioned name, or auto-created. */
@@ -489,6 +505,43 @@ async function oidcAccount(
   if (people.length) await db.batch(linkPeople(db, created.id, people));
   return created.id;
 }
+/** Another active administrator with a password remains besides `accountId`. */
+async function otherPasswordAdminExists(
+  db: D1Database,
+  accountId: number,
+): Promise<boolean> {
+  return !!(await one(
+    db,
+    "SELECT 1 AS found FROM accounts WHERE role='admin' AND disabled=0 AND password_hash IS NOT NULL AND id<>? LIMIT 1",
+    accountId,
+  ));
+}
+/**
+ * The admin group decides the role at every OIDC login. Group names are
+ * compared exactly. A missing claim never changes a role (the caller passes
+ * null then), and the last administrator with a password is never demoted.
+ */
+async function syncAdminRole(
+  db: D1Database,
+  accountId: number,
+  groups: string[],
+  adminGroup: string,
+): Promise<void> {
+  const wanted = groups.includes(adminGroup) ? "admin" : "user";
+  const account = await one<{ role: string; password_hash: string | null }>(
+    db,
+    "SELECT role,password_hash FROM accounts WHERE id=?",
+    accountId,
+  );
+  if (!account || account.role === wanted) return;
+  if (
+    wanted === "user" &&
+    account.password_hash !== null &&
+    !(await otherPasswordAdminExists(db, accountId))
+  )
+    return;
+  await run(db, "UPDATE accounts SET role=? WHERE id=?", wanted, accountId);
+}
 async function oidcRoute(
   request: Request,
   env: AppEnv,
@@ -525,6 +578,7 @@ async function oidcRoute(
             state,
             nonce,
             challenge,
+            oidcScope(settings),
           ),
           "Cache-Control": "no-store",
           "Set-Cookie": oidcCookie(state, 600, secure),
@@ -569,21 +623,33 @@ async function oidcRoute(
       return fail("OIDC sign-in failed; start again");
     }
     const d = await discover(settings.config.issuer, env.oidcFetch);
+    const tokens = await exchangeCode(
+      d,
+      settings.config,
+      redirectUri,
+      code,
+      login.verifier,
+      env.oidcFetch,
+    );
     const claims = await verifyIdToken(
-      await exchangeCode(
-        d,
-        settings.config,
-        redirectUri,
-        code,
-        login.verifier,
-        env.oidcFetch,
-      ),
+      tokens.idToken,
       d,
       settings.config,
       login.nonce,
       env.oidcFetch,
     );
+    // Groups: from the ID token, else from UserInfo (some providers only put them there).
+    let groups: string[] | null = null;
+    if (settings.adminGroup) {
+      groups = groupsOf(claims, settings.groupsClaim);
+      if (groups === null && tokens.accessToken)
+        groups = groupsOf(
+          await fetchUserinfo(d, tokens.accessToken, claims.sub, env.oidcFetch),
+          settings.groupsClaim,
+        );
+    }
     const accountId = await oidcAccount(db, claims, settings);
+    if (groups !== null) await syncAdminRole(db, accountId, groups, settings.adminGroup);
     await authLimit(db, request, "login", false);
     const { row } = await browserSession(db, request);
     const session = await rotateSession(db, row, accountId, secure);
@@ -2547,17 +2613,6 @@ const linkPeople = (db: D1Database, accountId: number, ids: number[]) =>
       .prepare("INSERT OR IGNORE INTO account_users(account_id,user_id) VALUES(?,?)")
       .bind(accountId, id),
   );
-/** Another active administrator besides `accountId` must remain. */
-async function otherAdminExists(
-  db: D1Database,
-  accountId: number,
-): Promise<boolean> {
-  return !!(await one(
-    db,
-    "SELECT 1 AS found FROM accounts WHERE role='admin' AND disabled=0 AND id<>? LIMIT 1",
-    accountId,
-  ));
-}
 /** Admin-only account management: create, edit and delete. */
 async function accountsPost(
   db: D1Database,
@@ -2573,7 +2628,8 @@ async function accountsPost(
     const password = formText(form, "password");
     // Without a password the account signs in through OIDC only.
     if (!password) {
-      if (role === "admin") throw new Error("Administrators need a password");
+      if (role === "admin" && !(await otherPasswordAdminExists(db, -1)))
+        throw new Error("At least one administrator must have a password");
       if (!oidcName || !(await oidcSettings(db)).enabled)
         throw new Error(
           "A password, or an OIDC username with OIDC enabled, is required",
@@ -2626,8 +2682,8 @@ async function accountsPost(
   const own = id === self.id;
   if (match[2]) {
     if (own) throw new Error("You cannot change your own role, block or delete your own account here");
-    if (target.role === "admin" && !(await otherAdminExists(db, id)))
-      throw new Error("There must be at least one active administrator");
+    if (target.role === "admin" && !(await otherPasswordAdminExists(db, id)))
+      throw new Error("At least one administrator must have a password");
     await db.batch([
       db.prepare("DELETE FROM admin_sessions WHERE account_id=?").bind(id),
       db.prepare("DELETE FROM accounts WHERE id=?").bind(id),
@@ -2643,9 +2699,9 @@ async function accountsPost(
   if (
     target.role === "admin" &&
     (role !== "admin" || disabled) &&
-    !(await otherAdminExists(db, id))
+    !(await otherPasswordAdminExists(db, id))
   )
-    throw new Error("There must be at least one active administrator");
+    throw new Error("At least one administrator must have a password");
   const password = formText(form, "password");
   const encoded = password ? await passwordHash(password) : null;
   const oidcName = formText(form, "oidc_username").trim().slice(0, 64);
@@ -2659,8 +2715,12 @@ async function accountsPost(
     throw new Error(
       "A password can only be removed when OIDC is enabled and the account has an OIDC login",
     );
-  if (role === "admin" && (removePassword || (!password && !target.password_hash)))
-    throw new Error("Administrators need a password");
+  if (
+    role === "admin" &&
+    (removePassword || (!password && !target.password_hash)) &&
+    !(await otherPasswordAdminExists(db, id))
+  )
+    throw new Error("At least one administrator must have a password");
   await db.batch([
     db
       .prepare(
@@ -2917,6 +2977,22 @@ async function browserPost(
           db,
           "password_login_users",
           formText(form, "password_users") === "1" ? "1" : "0",
+        ),
+        saveSetting(
+          db,
+          "oidc_admin_group",
+          formText(form, "admin_group").trim().slice(0, 200),
+        ),
+        saveSetting(
+          db,
+          "oidc_groups_claim",
+          formText(form, "groups_claim").trim().slice(0, 64) || "groups",
+        ),
+        saveSetting(
+          db,
+          "oidc_scopes",
+          formText(form, "scopes").trim().slice(0, 200) ||
+            "openid profile email",
         ),
       ]);
       return go("/admin", "OIDC settings saved");
