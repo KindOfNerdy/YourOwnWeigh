@@ -247,6 +247,7 @@ export function accountsSection(
       .map((a) => {
         const self = Number(a.id) === selfId;
         return `<dialog id="edit-account-${e(a.id)}"><button type="button" class="dialog-close" data-close-dialog aria-label="${T("common.close")}">×</button><h2>${e(t("users.edit", { name: String(a.username) }))}</h2><form action="/accounts/${e(a.id)}" method="post">${hidden(csrf)}
+      <label>${T("auth.username")}<input name="username" value="${e(a.username)}" maxlength="64" required autocomplete="off"></label>
       ${roleSelect(String(a.role), self)}${checkboxes(links.get(Number(a.id)) ?? new Set())}
       ${self ? "" : `<label><input type="checkbox" name="disabled" value="1"${a.disabled ? " checked" : ""}> ${T("accounts.disable")}</label>`}
       <label>${T("accounts.resetPassword")}<input name="password" type="password" minlength="8" autocomplete="new-password"></label>

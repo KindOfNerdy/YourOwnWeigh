@@ -379,3 +379,27 @@ test("a backup carries the accounts and their people, restoring access replaces 
     target.close();
   }
 });
+
+test("administrators rename accounts; names stay unique", async () => {
+  const h = await household();
+  try {
+    const admin = await adminBrowser(h.env);
+    await admin.post("/accounts", { username: "jane", password: "jane-password-1", role: "user" }, "/settings");
+    const id = (await h.db.prepare("SELECT id FROM accounts WHERE username='jane'").first<{ id: number }>())!.id;
+    assert.match(
+      location(await admin.post(`/accounts/${id}`, { username: "Owner", role: "user" }, "/settings")),
+      /Username\+is\+already\+taken/,
+    );
+    assert.match(
+      location(await admin.post(`/accounts/${id}`, { username: "jane.d", role: "user", people: "1" }, "/settings")),
+      /Account\+saved/,
+    );
+    assert.equal(
+      location(await browser(h.env).login("jane.d", "jane-password-1")).startsWith("/?"),
+      true,
+    );
+    assert.match(location(await browser(h.env).login("jane", "jane-password-1")), /Invalid\+username/);
+  } finally {
+    h.close();
+  }
+});

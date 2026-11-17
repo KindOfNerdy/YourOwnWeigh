@@ -2333,10 +2333,20 @@ async function accountsPost(
     throw new Error("There must be at least one active administrator");
   const password = formText(form, "password");
   const encoded = password ? await passwordHash(password) : null;
+  const username = validUsername(
+    formText(form, "username") ||
+      (await one<{ username: string }>(
+        db,
+        "SELECT username FROM accounts WHERE id=?",
+        id,
+      ))!.username,
+  );
+  if (await one(db, "SELECT id FROM accounts WHERE username=? AND id<>?", username, id))
+    throw new Error("Username is already taken");
   await db.batch([
     db
-      .prepare("UPDATE accounts SET role=?,disabled=? WHERE id=?")
-      .bind(role, disabled, id),
+      .prepare("UPDATE accounts SET username=?,role=?,disabled=? WHERE id=?")
+      .bind(username, role, disabled, id),
     ...(encoded
       ? [
           db
