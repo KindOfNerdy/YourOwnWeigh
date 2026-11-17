@@ -71,7 +71,7 @@ npm run setup:cloudflare -- --name YOUR-SHORT-WORKER-NAME --deploy
 
 _Choose a short Worker name_: the complete hostname must fit your scale's character limit below.
 
-3. Open the HTTPS URL printed by Wrangler. Enter the bootstrap token, then pick a username and password for the first administrator. The Sync API (for reading data out of YOW) accepts account logins too, and a shared household login (`reader`) by default (you can override). Administrators add more accounts under Admin (which also holds display, backup and Sync API settings); a user account only sees and edits the people linked to it (an administrator can narrow their own view the same way). Optional OpenID Connect sign-in (Pocket ID, Authentik, Keycloak …) is configured on the same page; accounts can then work without a password, and administrators always keep theirs as a fallback.
+3. Open the HTTPS URL printed by Wrangler. Enter the bootstrap token, then pick a username and password for the first administrator. The Sync API (for reading data out of YOW) accepts account logins too, and a shared household login (`reader`) by default (you can override). Administrators add more accounts under Admin (which also holds display, backup and Sync API settings); a user account only sees and edits the people linked to it (an administrator can narrow their own view the same way). Optional OpenID Connect sign-in (Pocket ID, Authentik, Keycloak …) is configured on the same page; accounts can then work without a password, and at least one administrator keeps a password as a fallback. An optional admin group (the `groups` claim by default) makes its members administrators at every login.
 4. Install and start the Python bridge:
 
    ```sh

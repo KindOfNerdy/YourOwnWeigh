@@ -278,6 +278,9 @@ export function oidcSection(
     hasSecret: boolean;
     autoCreate: boolean;
     passwordUsers: boolean;
+    adminGroup: string;
+    groupsClaim: string;
+    scopes: string;
   },
   redirectUri: string,
   language: Language = "en",
@@ -293,6 +296,9 @@ export function oidcSection(
       <label>${T("oidc.issuer")}<input name="issuer" type="url" value="${e(o.issuer)}" placeholder="https://id.example.com"></label>
       <label>${T("oidc.clientId")}<input name="client_id" value="${e(o.clientId)}" autocomplete="off"></label>
       <label>${T("oidc.clientSecret")}<input name="client_secret" type="password" autocomplete="new-password" placeholder="${o.hasSecret ? "••••••••" : ""}"></label></div>
+      <div class="device-grid"><label>${T("oidc.adminGroup")}<input name="admin_group" value="${e(o.adminGroup)}" maxlength="200" autocomplete="off"></label>
+      <label>${T("oidc.groupsClaim")}<input name="groups_claim" value="${e(o.groupsClaim)}" placeholder="groups" maxlength="64" autocomplete="off"></label>
+      <label>${T("oidc.scopes")}<input name="scopes" value="${e(o.scopes)}" maxlength="200" autocomplete="off"></label></div>
       ${box("auto_create", o.autoCreate, "oidc.autoCreate")}
       ${box("password_users", o.passwordUsers, "oidc.passwordUsers")}
       <p class="hint">${T("oidc.redirectUri")} <code>${e(redirectUri)}</code></p>

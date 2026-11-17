@@ -33,6 +33,10 @@ function provider() {
     alg: "RS256" as string,
     signWith: "rsa" as "rsa" | "ec" | "ec384" | "ed" | "other",
     rejectToken: false,
+    /** Claims the UserInfo endpoint returns, and the subject it claims. */
+    userinfo: {} as Record<string, unknown>,
+    userinfoSub: "sub-1",
+    lastScope: "",
     mint(claims: Record<string, unknown>) {
       const kid = { ec: "ec1", ec384: "ec384", ed: "ed1" }[idp.signWith as string] ?? "rsa1";
       const head = b64({ alg: idp.alg, kid, typ: "JWT" });
@@ -56,7 +60,13 @@ function provider() {
           authorization_endpoint: `${ISSUER}/authorize`,
           token_endpoint: `${ISSUER}/token`,
           jwks_uri: `${ISSUER}/jwks`,
+          userinfo_endpoint: `${ISSUER}/userinfo`,
         });
+      if (url === `${ISSUER}/userinfo`) {
+        const bearer = new Headers(init?.headers).get("authorization");
+        if (bearer !== "Bearer at-1") return new Response("{}", { status: 401 });
+        return Response.json({ sub: idp.userinfoSub, ...idp.userinfo });
+      }
       if (url === `${ISSUER}/jwks`) return Response.json({ keys });
       if (url === `${ISSUER}/token`) {
         const form = new URLSearchParams(String(init?.body));
@@ -71,6 +81,7 @@ function provider() {
           return new Response("{}", { status: 400 });
         const now = Math.floor(Date.now() / 1000);
         return Response.json({
+          access_token: "at-1",
           id_token: idp.mint({
             iss: ISSUER,
             aud: CLIENT,
@@ -86,12 +97,15 @@ function provider() {
       return new Response("not found", { status: 404 });
     }) as typeof fetch,
     reset() {
+      idp.userinfo = {};
+      idp.userinfoSub = "sub-1";
       idp.claims = {};
       idp.alg = "RS256";
       idp.signWith = "rsa";
       idp.rejectToken = false;
     },
     remember(authorizeUrl: URL) {
+      idp.lastScope = authorizeUrl.searchParams.get("scope") ?? "";
       pending.nonce = authorizeUrl.searchParams.get("nonce")!;
       pending.challenge = authorizeUrl.searchParams.get("code_challenge")!;
     },
@@ -310,21 +324,28 @@ test("password sign-in can be switched off for users while administrators keep i
   }
 });
 
-test("administrators always keep a password; users can drop theirs once OIDC works", async () => {
+test("at least one administrator keeps a password; users can drop theirs once OIDC works", async () => {
   const { h, admin } = await setup();
   try {
+    // An administrator without a password is fine while another one has a password.
     assert.match(
       location(await admin.post("/accounts", { username: "boss", password: "", role: "admin", oidc_username: "boss" }, "/admin")),
-      /Administrators\+need\+a\+password/,
+      /Account\+created/,
     );
     assert.match(
       location(await admin.post("/accounts", { username: "nobody", password: "", role: "user" }, "/admin")),
-      /password%2C\+or\+an\+OIDC\+username|OIDC\+username/,
+      /OIDC\+username/,
     );
     const own = (await h.db.prepare("SELECT id FROM accounts WHERE username='owner'").first<{ id: number }>())!.id;
+    // The only administrator with a password cannot drop it, be demoted or deleted.
     assert.match(
       location(await admin.post(`/accounts/${own}`, { remove_password: "1", oidc_username: "owner" }, "/admin")),
-      /Administrators\+need\+a\+password|can\+only\+be\+removed/,
+      /At\+least\+one\+administrator\+must\+have\+a\+password|can\+only\+be\+removed/,
+    );
+    const boss = (await h.db.prepare("SELECT id FROM accounts WHERE username='boss'").first<{ id: number }>())!.id;
+    assert.match(
+      location(await admin.post(`/accounts/${boss}`, { role: "user", oidc_username: "boss" }, "/admin")),
+      /Account\+saved/,
     );
     await admin.post("/accounts", { username: "jane", password: "jane-password-1", role: "user", oidc_username: "jane" }, "/admin");
     const jane = (await h.db.prepare("SELECT id FROM accounts WHERE username='jane'").first<{ id: number }>())!.id;
@@ -336,9 +357,10 @@ test("administrators always keep a password; users can drop theirs once OIDC wor
       (await h.db.prepare("SELECT password_hash FROM accounts WHERE id=?").bind(jane).first<{ password_hash: string | null }>())?.password_hash,
       null,
     );
+    // The password-less user may become an administrator while owner keeps a password.
     assert.match(
       location(await admin.post(`/accounts/${jane}`, { role: "admin", oidc_username: "jane" }, "/admin")),
-      /Administrators\+need\+a\+password/,
+      /Account\+saved/,
     );
   } finally {
     h.close();
@@ -471,6 +493,85 @@ test("an e-mail address only pre-provisions an account when the provider verifie
     assert.equal((await oidcLogin(h.env, idp)).session, undefined);
     idp.claims = { preferred_username: "somebody", email: "jane@example.org", email_verified: true };
     assert.equal(await signedIn(h.env, (await oidcLogin(h.env, idp, { iss: `${ISSUER}/` })).session), true);
+  } finally {
+    h.close();
+  }
+});
+
+const roleOf = async (h: Awaited<ReturnType<typeof setup>>["h"], name: string) =>
+  (await h.db.prepare("SELECT role FROM accounts WHERE username=?").bind(name).first<{ role: string }>())?.role;
+
+test("the admin group decides the role at every login, from the ID token or UserInfo", async () => {
+  const { h, idp, admin, configure } = await setup();
+  try {
+    await configure({ admin_group: "yow-admins", auto_create: "1" });
+    // The groups scope is requested on top of the configured scopes.
+    await admin.post("/accounts", { username: "jane", password: "", role: "user", oidc_username: "jane" }, "/admin");
+    await oidcLogin(h.env, idp);
+    assert.match(idp.lastScope, /openid profile email groups/);
+    assert.equal(await roleOf(h, "jane"), "user");
+    // Member: promoted at the next login.
+    idp.claims = { groups: ["family", "yow-admins"] };
+    assert.equal(await signedIn(h.env, (await oidcLogin(h.env, idp)).session), true);
+    assert.equal(await roleOf(h, "jane"), "admin");
+    // Names are compared exactly.
+    idp.claims = { groups: ["YOW-Admins"] };
+    await oidcLogin(h.env, idp);
+    assert.equal(await roleOf(h, "jane"), "user");
+    // A space separated string works too.
+    idp.claims = { groups: "family yow-admins" };
+    await oidcLogin(h.env, idp);
+    assert.equal(await roleOf(h, "jane"), "admin");
+    // No claim anywhere: the role stays as it is.
+    idp.claims = {};
+    await oidcLogin(h.env, idp);
+    assert.equal(await roleOf(h, "jane"), "admin");
+    // Not in the group any more: demoted (owner still has a password).
+    idp.claims = { groups: [] };
+    await oidcLogin(h.env, idp);
+    assert.equal(await roleOf(h, "jane"), "user");
+    // UserInfo is used when the ID token has no groups claim at all.
+    idp.claims = {};
+    idp.userinfo = { groups: ["yow-admins"] };
+    await oidcLogin(h.env, idp);
+    assert.equal(await roleOf(h, "jane"), "admin");
+    // UserInfo for another subject is rejected and changes nothing.
+    idp.userinfo = { groups: [] };
+    idp.userinfoSub = "someone-else";
+    const refused = await oidcLogin(h.env, idp);
+    assert.equal(refused.session, undefined);
+    assert.equal(await roleOf(h, "jane"), "admin");
+  } finally {
+    h.close();
+  }
+});
+
+test("a new OIDC account gets the role of its groups, a custom claim name works, and without an admin group roles are not touched", async () => {
+  const { h, idp, configure } = await setup();
+  try {
+    await configure({ admin_group: "boss", groups_claim: "roles", auto_create: "1" });
+    idp.claims = { sub: "sub-7", preferred_username: "newadmin", roles: ["boss"] };
+    assert.equal(await signedIn(h.env, (await oidcLogin(h.env, idp)).session), true);
+    assert.equal(await roleOf(h, "newadmin"), "admin");
+    await configure({ admin_group: "", groups_claim: "roles", auto_create: "1" });
+    idp.claims = { sub: "sub-7", preferred_username: "newadmin", roles: [] };
+    await oidcLogin(h.env, idp);
+    assert.equal(await roleOf(h, "newadmin"), "admin");
+    assert.doesNotMatch(idp.lastScope, /roles/);
+  } finally {
+    h.close();
+  }
+});
+
+test("the last administrator with a password is never demoted by the group", async () => {
+  const { h, idp, admin, configure } = await setup();
+  try {
+    await configure({ admin_group: "yow-admins" });
+    const own = (await h.db.prepare("SELECT id FROM accounts WHERE username='owner'").first<{ id: number }>())!.id;
+    await admin.post(`/accounts/${own}`, { oidc_username: "jane", see_all: "1" }, "/admin");
+    idp.claims = { groups: [] };
+    assert.equal(await signedIn(h.env, (await oidcLogin(h.env, idp)).session), true);
+    assert.equal(await roleOf(h, "owner"), "admin");
   } finally {
     h.close();
   }

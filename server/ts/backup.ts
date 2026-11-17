@@ -57,6 +57,9 @@ const access = new Set([
   "oidc_client_secret",
   "oidc_auto_create",
   "password_login_users",
+  "oidc_admin_group",
+  "oidc_groups_claim",
+  "oidc_scopes",
 ]);
 const preferences = new Set([
   "display_weight_unit",
@@ -599,7 +602,7 @@ export async function commitBackup(
   if (restoreAccess) {
     statements.push(
       db.prepare(
-        "DELETE FROM settings WHERE key IN ('admin_password','api_password','sync_password_mode','oidc_enabled','oidc_name','oidc_issuer','oidc_client_id','oidc_client_secret','oidc_auto_create','password_login_users')",
+        "DELETE FROM settings WHERE key IN ('admin_password','api_password','sync_password_mode','oidc_enabled','oidc_name','oidc_issuer','oidc_client_id','oidc_client_secret','oidc_auto_create','password_login_users','oidc_admin_group','oidc_groups_claim','oidc_scopes')",
       ),
     );
     statements.push(
