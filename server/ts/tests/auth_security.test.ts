@@ -25,10 +25,10 @@ test("expired browser sessions are purged and login failures are isolated by pee
     const login = (ip: string, password: string) => handleApp(new Request("https://local.test/login", {
       method: "POST",
       headers: { Cookie: cookie, Origin: "https://local.test", "X-YOW-Peer-IP": ip },
-      body: new URLSearchParams({ _csrf: csrf, password }),
+      body: new URLSearchParams({ _csrf: csrf, username: "admin", password }),
     }), { DB: db });
     for (let i = 0; i < 20; i++)
-      assert.match((await login("203.0.113.8", "wrong")).headers.get("location") ?? "", /Invalid.password/);
+      assert.match((await login("203.0.113.8", "wrong")).headers.get("location") ?? "", /Invalid.username.or.password/);
     assert.match((await login("203.0.113.8", "correct-password")).headers.get("location") ?? "", /Too.many.attempts/);
     assert.equal((await login("198.51.100.2", "correct-password")).headers.get("location"), "/?notice=Signed+in");
   } finally {

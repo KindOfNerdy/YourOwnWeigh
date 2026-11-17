@@ -71,7 +71,7 @@ npm run setup:cloudflare -- --name YOUR-SHORT-WORKER-NAME --deploy
 
 _Choose a short Worker name_: the complete hostname must fit your scale's character limit below.
 
-3. Open the HTTPS URL printed by Wrangler. Enter the bootstrap token, then set an admin password. The Sync API (for reading data out of YOW) uses it too, by default (you can override).
+3. Open the HTTPS URL printed by Wrangler. Enter the bootstrap token, then pick a username and password for the first administrator. The Sync API (for reading data out of YOW) accepts account logins too, and a shared household login (`reader`) by default (you can override). Administrators add more accounts under Settings; a user account only sees and edits the people linked to it.
 4. Install and start the Python bridge:
 
    ```sh

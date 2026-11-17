@@ -156,16 +156,27 @@ export function namedMetrics(row: Record<string, any>): Record<string, number> {
     }),
   );
 }
+/** Metrics seen in readings: all, one person, or a set of people plus
+ * (optionally) readings that no person owns yet. */
 export async function observedMetrics(
   db: D1Database,
-  userId?: number,
+  who?: number | { userIds: number[]; unassigned: boolean },
 ): Promise<Metric[]> {
+  let where = "";
+  const args: number[] = [];
+  if (typeof who === "number") {
+    where = " WHERE r.user_id=?";
+    args.push(who);
+  } else if (who) {
+    where = ` WHERE (r.user_id IN (${who.userIds.map(() => "?").join(",") || "NULL"})${who.unassigned ? " OR r.user_id IS NULL" : ""})`;
+    args.push(...who.userIds);
+  }
   const result = await db
     .prepare(
       "SELECT DISTINCT json_extract(m.value,'$.type') AS type FROM readings r, json_each(r.measures_json) m" +
-        (userId === undefined ? "" : " WHERE r.user_id=?"),
+        where,
     )
-    .bind(...(userId === undefined ? [] : [userId]))
+    .bind(...args)
     .all<{ type: number }>();
   const seen = new Set([1, ...result.results.map((r) => r.type)]);
   return METRICS.filter((m) => seen.has(m.type));

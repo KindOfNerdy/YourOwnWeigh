@@ -147,6 +147,20 @@ export class LocalSqlite {
         "utf8",
       ),
     );
+    if (
+      !(
+        this.database
+          .prepare("PRAGMA table_info(admin_sessions)")
+          .all() as Array<{ name: string }>
+      ).some((c) => c.name === "account_id")
+    ) {
+      this.database.exec(
+        readFileSync(
+          join(ROOT, "server/migrations/0012_accounts.sql"),
+          "utf8",
+        ),
+      );
+    }
   }
   private upgradeOlderDatabase(): void {
     const columns = (table: string): Set<string> =>

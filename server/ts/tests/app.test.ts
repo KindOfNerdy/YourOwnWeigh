@@ -936,6 +936,7 @@ test("portable PBKDF2 hash logs in and admin rotation invalidates other sessions
         headers: { Cookie: cookie },
         body: new URLSearchParams({
           _csrf: csrf,
+          username: "admin",
           password: "admin-password-123",
         }),
       }),
@@ -971,9 +972,16 @@ test("portable PBKDF2 hash logs in and admin rotation invalidates other sessions
     assert.equal(changed.status, 303);
     const rotated = await store
       .asD1()
-      .prepare("SELECT value FROM settings WHERE key='admin_password'")
+      .prepare("SELECT password_hash AS value FROM accounts WHERE username='admin'")
       .first<{ value: string }>();
     assert.match(rotated?.value ?? "", /^pbkdf2_sha256\$100000\$/);
+    assert.equal(
+      await store
+        .asD1()
+        .prepare("SELECT 1 AS found FROM settings WHERE key='admin_password'")
+        .first(),
+      null,
+    );
     assert.equal(
       (
         await handleApp(

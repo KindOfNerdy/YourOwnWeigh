@@ -155,20 +155,30 @@ export function layout(
   title: string,
   body: string,
   csrf: string,
-  loggedIn: boolean,
+  account: { username: string; role: string } | null,
   notice = "",
   active = "",
   language: Language = "en",
 ): string {
   const t = translator(language);
+  const loggedIn = account !== null;
   const links = [
     ["/", t("nav.dashboard")],
     ["/readings", t("nav.readings")],
-    ["/scales", t("nav.scales")],
-    ["/users", t("nav.users")],
+    ...(account?.role === "admin"
+      ? [
+          ["/scales", t("nav.scales")],
+          ["/users", t("nav.users")],
+        ]
+      : []),
     ["/sync", t("nav.sync")],
-    ["/settings", t("nav.settings")],
-    ["/firmware", t("nav.firmware")],
+    ...(account?.role === "admin"
+      ? [
+          ["/settings", t("nav.settings")],
+          ["/firmware", t("nav.firmware")],
+        ]
+      : []),
+    ["/account", t("nav.account")],
   ];
   return `<!doctype html><html lang="${language}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
     <title>${e(title)} · YourOwnWeigh</title><link rel="icon" href="/favicon.png" type="image/png">
@@ -195,14 +205,14 @@ export function setupPage(
   const T = (key: MessageKey) => e(t(key));
   if (bootstrapRequired && !unlocked)
     return `<section><h1>${T("setup.welcome")}</h1><p>${T("setup.tokenIntro")}</p><form method="post">${hidden(csrf)}<input type="hidden" name="step" value="bootstrap"><label>${T("setup.token")}<input name="bootstrap_token" type="password" required autocomplete="off"></label><button>${T("common.continue")}</button></form></section>`;
-  return `<section><h1>${T("setup.passwordTitle")}</h1><p>${T("setup.passwordIntro")}</p><form method="post">${hidden(csrf)}<input type="hidden" name="step" value="password"><label>${T("auth.adminPassword")}<input name="password" type="password" minlength="8" required autocomplete="new-password"></label><label>${T("setup.confirmAdmin")}<input name="confirm" type="password" minlength="8" required autocomplete="new-password"></label>
+  return `<section><h1>${T("setup.passwordTitle")}</h1><p>${T("setup.passwordIntro")}</p><form method="post">${hidden(csrf)}<input type="hidden" name="step" value="password"><label>${T("auth.username")}<input name="username" value="admin" maxlength="64" required autocomplete="username"></label><label>${T("auth.adminPassword")}<input name="password" type="password" minlength="8" required autocomplete="new-password"></label><label>${T("setup.confirmAdmin")}<input name="confirm" type="password" minlength="8" required autocomplete="new-password"></label>
     <label><input type="checkbox" name="separate_sync" value="1" data-toggle="setup-sync-fields"> ${T("sync.alternativePassword")}</label><div id="setup-sync-fields" hidden><label>${T("setup.syncPassword")}<input name="sync_password" type="password" minlength="8" autocomplete="new-password"></label><label>${T("setup.syncConfirm")}<input name="sync_confirm" type="password" minlength="8" autocomplete="new-password"></label></div><button>${T("setup.create")}</button></form></section>`;
 }
 export function loginPage(
   csrf: string,
   t: Translate = translator("en"),
 ): string {
-  return `<section><h1>${e(t("auth.signIn"))}</h1><form method="post">${hidden(csrf)}<label>${e(t("auth.adminPassword"))}<input name="password" type="password" required></label><button>${e(t("auth.signIn"))}</button></form></section>`;
+  return `<section><h1>${e(t("auth.signIn"))}</h1><form method="post">${hidden(csrf)}<label>${e(t("auth.username"))}<input name="username" required autocomplete="username"></label><label>${e(t("auth.password"))}<input name="password" type="password" required autocomplete="current-password"></label><button>${e(t("auth.signIn"))}</button></form></section>`;
 }
 function readingTime(row: Row, language: Language = "en"): string {
   const trusted = row.time_quality === "trusted";
@@ -272,6 +282,7 @@ export function readingsPage(
   metric = 1,
   language: Language = "en",
   showScale = true,
+  canDelete = true,
 ): string {
   const t = translator(language);
   const T = (key: MessageKey) => e(t(key));
@@ -286,7 +297,7 @@ export function readingsPage(
             r.user_id
               ? "—"
               : `<div class="actions">${users.length ? `<form class="inline-form" action="/readings/${e(r.id)}/assign" method="post">${hidden(csrf)}<label class="hint">${T("readings.assignTo")}</label><select name="user_id" required><option value="">${T("readings.chooseUser")}</option>${users.map((u) => option(u.id, u.name, "")).join("")}</select><button>${T("readings.assign")}</button></form>` : ""}
-      <form action="/readings/${e(r.id)}/delete" method="post" data-confirm="${T("readings.confirmDelete")}">${hidden(csrf)}<button class="danger">${T("common.delete")}</button></form></div>`
+      ${canDelete ? `<form action="/readings/${e(r.id)}/delete" method="post" data-confirm="${T("readings.confirmDelete")}">${hidden(csrf)}<button class="danger">${T("common.delete")}</button></form>` : ""}</div>`
           }</td></tr>`,
       )
       .join("")}
@@ -337,6 +348,28 @@ function userFields(
           ? `<label><input type="checkbox" name="scales" value="${e(scales[0].id)}"${!user || members.has(scales[0].id) ? " checked" : ""}> ${T("users.onScale")}</label>`
           : ""
     }`;
+}
+/** The signed-in account: its password and the profiles of its people. */
+export function accountPage(
+  account: { username: string; role: string },
+  people: Row[],
+  csrf: string,
+  language: Language = "en",
+): string {
+  const t = translator(language);
+  const T = (key: MessageKey) => e(t(key));
+  return `<section class="page-heading"><div><h1>${T("account.title")}</h1><p>${e(t("account.signedInAs", { name: account.username }))} · ${T(account.role === "admin" ? "account.role.admin" : "account.role.user")}</p></div></section>
+    <div class="firmware-grid"><section><h2>${T("account.changePassword")}</h2><form action="/account" method="post">${hidden(csrf)}
+      <label>${T("account.currentPassword")}<input name="current" type="password" required autocomplete="current-password"></label>
+      <label>${T("account.newPassword")}<input name="new" type="password" minlength="8" required autocomplete="new-password"></label>
+      <label>${T("account.confirmPassword")}<input name="confirm" type="password" minlength="8" required autocomplete="new-password"></label>
+      <button>${T("users.save")}</button></form></section>
+    <section><h2>${T("account.people")}</h2>${
+      people.length
+        ? `<p class="hint">${T("account.profileHint")}</p><ul>${people.map((u) => `<li>${e(u.name)} <button type="button" class="secondary" data-open-dialog="edit-user-${e(u.id)}">${T("common.edit")}</button></li>`).join("")}</ul>`
+        : `<p class="empty">${T("account.noPeople")}</p>`
+    }</section></div>
+    ${people.map((u) => `<dialog id="edit-user-${e(u.id)}"><button type="button" class="dialog-close" data-close-dialog>×</button><h2>${e(t("users.edit", { name: String(u.name ?? "") }))}</h2><form action="/users/${e(u.id)}" method="post">${hidden(csrf)}${userFields(u, [], new Set(), t)}<div class="dialog-actions"><button>${T("users.save")}</button></div></form></dialog>`).join("")}`;
 }
 export function usersPage(
   users: Row[],

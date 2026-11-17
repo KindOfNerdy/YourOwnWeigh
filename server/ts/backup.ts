@@ -79,6 +79,31 @@ export async function exportBackup(db: D1Database): Promise<Backup> {
     sections.map((table, i) => [table, results[i].results as Row[]]),
   );
   const accessSettings = rows.settings.filter((r) => access.has(String(r.key)));
+  const accounts = (
+    await db
+      .prepare(
+        "SELECT id,username,password_hash,role,disabled,oidc_issuer,oidc_subject FROM accounts ORDER BY id",
+      )
+      .all<Row>()
+  ).results;
+  if (accounts.length) {
+    const links = (
+      await db
+        .prepare("SELECT account_id,user_id FROM account_users")
+        .all<Row>()
+    ).results;
+    accessSettings.push({
+      key: "accounts",
+      value: JSON.stringify(
+        accounts.map(({ id, ...account }) => ({
+          ...account,
+          people: links
+            .filter((link) => link.account_id === id)
+            .map((link) => link.user_id),
+        })),
+      ),
+    });
+  }
   rows.settings = rows.settings.filter((r) => preferences.has(String(r.key)));
   // Old experiments used this free-form field. Current settings and reviewed
   // captures have explicit sections; do not export an opaque vendor session.
@@ -99,6 +124,35 @@ function integer(
   return (
     Number.isSafeInteger(value) && Number(value) >= min && Number(value) <= max
   );
+}
+const PASSWORD_HASH =
+  /^pbkdf2_sha256\$(100000|[1-9][0-9]{5})\$[a-f0-9]{32}\$[a-f0-9]{64}$/;
+/** The accounts entry of accessSettings: a JSON list of accounts and their people. */
+function validAccounts(value: string): void {
+  const list = JSON.parse(value);
+  if (!Array.isArray(list) || list.length > 1000)
+    throw new Error("Invalid access settings");
+  const names = new Set<string>();
+  for (const a of list) {
+    const name =
+      typeof a?.username === "string" ? a.username.toLowerCase() : "";
+    if (
+      !name ||
+      a.username.length > 64 ||
+      /[\s:\u0000-\u001f]/u.test(a.username) ||
+      names.has(name) ||
+      !["admin", "user"].includes(a.role) ||
+      ![0, 1].includes(a.disabled) ||
+      !(a.password_hash === null || PASSWORD_HASH.test(a.password_hash)) ||
+      !["string", "object"].includes(typeof a.oidc_issuer) ||
+      !["string", "object"].includes(typeof a.oidc_subject) ||
+      !Array.isArray(a.people) ||
+      a.people.length > 10000 ||
+      !a.people.every((id: unknown) => integer(id, 1, 2147483647))
+    )
+      throw new Error("Invalid access settings");
+    names.add(name);
+  }
 }
 function parse(raw: string): Backup {
   if (new TextEncoder().encode(raw).length > MAX_BYTES)
@@ -304,6 +358,13 @@ function parse(raw: string): Backup {
       throw new Error("Unknown preference");
   const seenAccess = new Set();
   for (const r of b.accessSettings) {
+    if (r.key === "accounts") {
+      if (typeof r.value !== "string" || seenAccess.has(r.key))
+        throw new Error("Invalid access settings");
+      validAccounts(r.value);
+      seenAccess.add(r.key);
+      continue;
+    }
     if (
       !access.has(String(r.key)) ||
       typeof r.value !== "string" ||
@@ -390,7 +451,9 @@ export async function stageBackup(
     counts: Object.fromEntries(
       sections.map((s) => [s, data.sections[s].length]),
     ),
-    hasAccess: data.accessSettings.some((r) => r.key === "admin_password"),
+    hasAccess: data.accessSettings.some(
+      (r) => r.key === "admin_password" || r.key === "accounts",
+    ),
   };
 }
 export async function commitBackup(
@@ -417,12 +480,12 @@ export async function commitBackup(
     restoreAccess &&
     !(await db
       .prepare(
-        "SELECT 1 FROM backup_staging_rows WHERE import_id=? AND section='accessSettings' AND json_extract(row_json,'$.key')='admin_password'",
+        "SELECT 1 FROM backup_staging_rows WHERE import_id=? AND section='accessSettings' AND json_extract(row_json,'$.key') IN ('admin_password','accounts')",
       )
       .bind(id)
       .first())
   )
-    throw new Error("Backup has no admin password to restore");
+    throw new Error("Backup has no admin account to restore");
   const conflict = await db
     .prepare(
       "SELECT 1 FROM backup_staging_rows s JOIN scales d ON d.mac=json_extract(s.row_json,'$.mac') WHERE s.import_id=? AND s.section='scales' AND (d.model<>json_extract(s.row_json,'$.model') OR d.secret<>json_extract(s.row_json,'$.secret')) LIMIT 1",
@@ -532,7 +595,25 @@ export async function commitBackup(
     statements.push(
       db
         .prepare(
-          "INSERT INTO settings(key,value) SELECT json_extract(row_json,'$.key'),json_extract(row_json,'$.value') FROM backup_staging_rows WHERE import_id=? AND section='accessSettings'",
+          "INSERT INTO settings(key,value) SELECT json_extract(row_json,'$.key'),json_extract(row_json,'$.value') FROM backup_staging_rows WHERE import_id=? AND section='accessSettings' AND json_extract(row_json,'$.key')<>'accounts'",
+        )
+        .bind(id),
+    );
+    statements.push(db.prepare("DELETE FROM account_users"));
+    statements.push(db.prepare("DELETE FROM accounts"));
+    const staged =
+      "FROM backup_staging_rows s, json_each(json_extract(s.row_json,'$.value')) a WHERE s.import_id=? AND s.section='accessSettings' AND json_extract(s.row_json,'$.key')='accounts'";
+    statements.push(
+      db
+        .prepare(
+          `INSERT INTO accounts(username,password_hash,role,disabled,oidc_issuer,oidc_subject,created_at) SELECT json_extract(a.value,'$.username'),json_extract(a.value,'$.password_hash'),json_extract(a.value,'$.role'),json_extract(a.value,'$.disabled'),json_extract(a.value,'$.oidc_issuer'),json_extract(a.value,'$.oidc_subject'),${now()} ${staged}`,
+        )
+        .bind(id),
+    );
+    statements.push(
+      db
+        .prepare(
+          `INSERT OR IGNORE INTO account_users(account_id,user_id) SELECT c.id,p.value FROM backup_staging_rows s, json_each(json_extract(s.row_json,'$.value')) a, json_each(json_extract(a.value,'$.people')) p JOIN accounts c ON c.username=json_extract(a.value,'$.username') WHERE s.import_id=? AND s.section='accessSettings' AND json_extract(s.row_json,'$.key')='accounts' AND EXISTS (SELECT 1 FROM users u WHERE u.id=p.value)`,
         )
         .bind(id),
     );

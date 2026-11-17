@@ -192,9 +192,13 @@ export async function startLocal() {
   const store = new LocalSqlite(dbPath);
   const tokenPath = join(dirname(dbPath), "bootstrap-token.txt");
   let bootstrap = config.YOW_BOOTSTRAP_TOKEN;
-  const initialized = await store
-    .prepare("SELECT value FROM settings WHERE key='admin_password'")
-    .first();
+  const initialized =
+    (await store
+      .prepare("SELECT 1 AS found FROM accounts WHERE role='admin' LIMIT 1")
+      .first()) ||
+    (await store
+      .prepare("SELECT value FROM settings WHERE key='admin_password'")
+      .first());
   if (!bootstrap && !initialized) {
     if (existsSync(tokenPath))
       bootstrap = readFileSync(tokenPath, "utf8").trim();

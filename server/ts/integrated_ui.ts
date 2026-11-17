@@ -161,6 +161,7 @@ export function syncPage(
   origin: string,
   users: Row[],
   language: Language = "en",
+  username = "reader",
 ): string {
   const t = translator(language);
   const T = (key: MessageKey) => e(t(key));
@@ -170,7 +171,7 @@ export function syncPage(
     <div class="firmware-grid"><section><h2>${T("sync.appleHealth")}</h2><p>${T("sync.shortcutIntro")}</p>
     <a class="button" href="/YourOwnWeigh-Sync.shortcut" download="YourOwnWeigh Sync.shortcut">${T("sync.download")}</a><dl><dt>${T("sync.serverUrl")}</dt><dd><code>${e(origin)}</code></dd><dt>${T("sync.userId")}</dt><dd>${users.map((u) => `${e(u.name)}: <code>${e(u.id)}</code> / <code>${e(u.short_name)}</code>`).join("<br>") || T("sync.addUserFirst")}</dd><dt>${T("sync.password")}</dt><dd>${T("sync.passwordHint")}</dd></dl>
     <p class="hint">${T("sync.automationHint")}</p></section>
-    <section><h2>${T("sync.http")}</h2><p>${T("sync.httpIntro")}</p><pre>curl --user reader \\\n  '${e(origin)}/api/users/USER/readings?since=2026-01-01'</pre><p class="hint">${T("sync.curlHint")}</p><p>${H("sync.readingsHint")}</p><p>${H("sync.healthSyncHint")}</p></section></div>`;
+    <section><h2>${T("sync.http")}</h2><p>${T("sync.httpIntro")}</p><pre>curl --user ${e(username)} \\\n  '${e(origin)}/api/users/USER/readings?since=2026-01-01'</pre><p class="hint">${T("sync.curlHint")}</p><p>${H("sync.readingsHint")}</p><p>${H("sync.healthSyncHint")}</p></section></div>`;
 }
 export function settingsWorkspace(
   csrf: string,
@@ -206,4 +207,51 @@ export function settingsWorkspace(
     <dialog id="backup-import-dialog"><button class="dialog-close" data-close-dialog type="button" aria-label="${T("common.close")}">×</button><h2>${T("settings.import")}</h2><p>${T("settings.importIntro")}</p><form id="backup-import" action="/api/backup/import" method="post" enctype="multipart/form-data">${hidden(csrf)}<label>${T("settings.backupFile")}<input type="file" name="backup" accept=".json" required></label><p class="hint">${T("settings.importHint")}</p><div class="dialog-actions"><button>${T("settings.reviewImport")}</button><button type="button" class="secondary" data-close-dialog>${T("common.cancel")}</button></div></form></dialog>
     <div class="firmware-grid"><section><h2>${T("auth.adminPassword")}</h2><p>${separate ? T("settings.syncSeparate") : T("settings.syncShared")}</p><form action="/settings" method="post">${hidden(csrf)}<input type="hidden" name="purpose" value="admin_password"><label>${T("settings.currentAdmin")}<input name="current" type="password" required></label><label>${T("settings.newPassword")}<input name="new" type="password" minlength="8" required></label><label>${T("settings.confirmPassword")}<input name="confirm" type="password" minlength="8" required></label><button>${T("settings.changeAdmin")}</button></form></section>
     <section><h2>${T("setup.syncPassword")}</h2><form action="/settings" method="post">${hidden(csrf)}<input type="hidden" name="purpose" value="sync_password"><label>${T("settings.currentAdmin")}<input name="current_admin" type="password" required></label><label><input type="checkbox" name="separate" value="1" data-toggle="sync-password-fields"${separate ? " checked" : ""}> ${T("sync.alternativePassword")}</label><div id="sync-password-fields"${separate ? "" : " hidden"}><label>${T("settings.newSync")}<input name="new" type="password" minlength="8"></label><label>${T("settings.confirmSync")}<input name="confirm" type="password" minlength="8"></label></div><button>${T("settings.saveSync")}</button></form></section></div>`;
+}
+
+/** Admin card on the settings page: browser accounts and the people they see. */
+export function accountsSection(
+  csrf: string,
+  accounts: Row[],
+  links: Map<number, Set<number>>,
+  people: Row[],
+  selfId: number,
+  language: Language = "en",
+): string {
+  const t = translator(language);
+  const T = (key: MessageKey) => e(t(key));
+  const checkboxes = (selected: Set<number>) =>
+    people.length
+      ? `<fieldset><legend>${T("accounts.people")}</legend>${people.map((p) => `<label><input type="checkbox" name="people" value="${e(p.id)}"${selected.has(Number(p.id)) ? " checked" : ""}> ${e(p.name)}</label>`).join("")}</fieldset>`
+      : "";
+  const roleSelect = (role: string, disabled = false) =>
+    `<label>${T("accounts.role")}<select name="role"${disabled ? " disabled" : ""}><option value="user"${role === "user" ? " selected" : ""}>${T("account.role.user")}</option><option value="admin"${role === "admin" ? " selected" : ""}>${T("account.role.admin")}</option></select></label>`;
+  const names = (id: number) =>
+    people
+      .filter((p) => links.get(id)?.has(Number(p.id)))
+      .map((p) => e(p.name))
+      .join(", ");
+  return `<section class="accounts-panel"><div class="section-heading"><h2>${T("accounts.title")}</h2><button type="button" data-open-dialog="add-account-dialog">${T("accounts.add")}</button></div><p>${T("accounts.intro")}</p>
+    <div class="wide"><table><thead><tr><th>${T("auth.username")}</th><th>${T("accounts.role")}</th><th>${T("accounts.people")}</th><th>${T("users.status")}</th><th></th></tr></thead><tbody>${accounts
+      .map(
+        (a) =>
+          `<tr><td>${e(a.username)}</td><td>${T(a.role === "admin" ? "account.role.admin" : "account.role.user")}</td><td>${a.role === "admin" ? T("accounts.everyone") : names(Number(a.id))}</td><td>${a.disabled ? T("accounts.disabled") : T("users.active")}</td><td><button type="button" class="secondary" data-open-dialog="edit-account-${e(a.id)}">${T("common.edit")}</button></td></tr>`,
+      )
+      .join("")}</tbody></table></div>
+    <dialog id="add-account-dialog"><button type="button" class="dialog-close" data-close-dialog aria-label="${T("common.close")}">×</button><h2>${T("accounts.add")}</h2><form action="/accounts" method="post">${hidden(csrf)}
+      <label>${T("auth.username")}<input name="username" maxlength="64" required autocomplete="off"></label>
+      <label>${T("auth.password")}<input name="password" type="password" minlength="8" required autocomplete="new-password"></label>
+      ${roleSelect("user")}${checkboxes(new Set())}<p class="hint">${T("accounts.matchHint")}</p>
+      <div class="dialog-actions"><button>${T("users.save")}</button></div></form></dialog>
+    ${accounts
+      .map((a) => {
+        const self = Number(a.id) === selfId;
+        return `<dialog id="edit-account-${e(a.id)}"><button type="button" class="dialog-close" data-close-dialog aria-label="${T("common.close")}">×</button><h2>${e(t("users.edit", { name: String(a.username) }))}</h2><form action="/accounts/${e(a.id)}" method="post">${hidden(csrf)}
+      ${roleSelect(String(a.role), self)}${checkboxes(links.get(Number(a.id)) ?? new Set())}
+      ${self ? "" : `<label><input type="checkbox" name="disabled" value="1"${a.disabled ? " checked" : ""}> ${T("accounts.disable")}</label>`}
+      <label>${T("accounts.resetPassword")}<input name="password" type="password" minlength="8" autocomplete="new-password"></label>
+      <div class="dialog-actions"><button>${T("users.save")}</button></div></form>
+      ${self ? "" : `<div class="dialog-actions"><form action="/accounts/${e(a.id)}/delete" method="post" data-confirm="${T("accounts.confirmDelete")}">${hidden(csrf)}<button class="danger">${T("accounts.delete")}</button></form></div>`}</dialog>`;
+      })
+      .join("")}</section>`;
 }

@@ -10,7 +10,7 @@ Node 24+ and `npm ci` are required. From the repository root:
 npm run setup:local -- --scale-host YOUR_MAC_LAN_IP
 ```
 
-The dashboard is `http://127.0.0.1:8080`. Setup creates a token under `local/data/bootstrap-token.txt` and prints it until the admin password exists. Enter it in the browser, then choose an eight-character-or-longer password. A separate Sync password is optional.
+The dashboard is `http://127.0.0.1:8080`. Setup creates a token under `local/data/bootstrap-token.txt` and prints it until the first administrator exists. Enter it in the browser, then choose a username and an eight-character-or-longer password. A separate Sync password is optional.
 
 For scale traffic, install [Caddy](https://caddyserver.com/docs/install) and run the generated Caddyfile using the command setup prints. Only the Caddy process needs access to ports 80/443; Node and Python must not run as root. Stop foreground processes with Ctrl-C. The generated proxy sends only scale traffic to the separate listener, whose route allowlist excludes admin, bootstrap, Sync and bridge paths. No firewall or router changes are made by setup.
 
@@ -105,7 +105,7 @@ Import uploads to bounded temporary staging (10 MiB / 25,000 rows), shows counts
 
 Backup import validates device models against the shared model registry, including WS-50 (`WBS02`). Earlier `WS50` device exports, backups and database records are normalised to `WBS02`. Merge and Replace retain linked readings and raw metrics; unknown model identifiers are rejected.
 
-The Sync API uses HTTP Basic `reader:password`, sharing the admin password by default. It accepts a numeric user ID or unique three-letter name. See Sync in the app and [Apple Health](../connectors/Apple%20Health/README.md). Unknown users and errors return JSON. Readings API access covers all household users; the requested user is a filter, not an authorization boundary.
+The Sync API uses HTTP Basic. An account logs in with its own username and password and only reaches the people linked to it (administrators reach everyone). The legacy name `reader` keeps household-wide access with the Sync API password, or with an administrator's password while the Sync API is shared. It accepts a numeric user ID or unique three-letter name. See Sync in the app and [Apple Health](../connectors/Apple%20Health/README.md). Unknown users, people outside the account's scope and errors return JSON.
 
 Use [`/api/users/USER/readings`](../contracts/readings/v1/README.md) for all metrics
 and raw groups. `/weights` and the Apple Health Shortcut remain weight-only.

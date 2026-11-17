@@ -14,6 +14,7 @@ import {
 import {
   firmwareWorkspace,
   scalesWorkspace,
+  accountsSection,
   settingsWorkspace,
   syncPage,
 } from "./integrated_ui.ts";
@@ -27,6 +28,7 @@ import {
 import { scaleModel } from "./models.ts";
 import { handleScaleRequest, zoneTriplet, roster, screenIds } from "./scale_api.ts";
 import {
+  accountPage,
   dashboardPage,
   escapeHtml,
   layout,
@@ -174,6 +176,15 @@ async function run(
     .bind(...args)
     .run();
 }
+async function accountLinks(db: D1Database): Promise<Map<number, Set<number>>> {
+  const links = new Map<number, Set<number>>();
+  for (const row of await rows<{ account_id: number; user_id: number }>(
+    db,
+    "SELECT account_id,user_id FROM account_users",
+  ))
+    links.set(row.account_id, (links.get(row.account_id) ?? new Set()).add(row.user_id));
+  return links;
+}
 async function severalScales(db: D1Database): Promise<boolean> {
   const count = await one<{ count: number }>(
     db,
@@ -242,6 +253,14 @@ type BrowserSession = {
   is_admin: number;
   auth_version: number;
   expires_at: number;
+  account_id?: number | null;
+};
+/** The signed-in browser account. `userIds` are the people it may see. */
+export type Account = {
+  id: number;
+  username: string;
+  role: "admin" | "user";
+  userIds: number[];
 };
 async function browserSession(
   db: D1Database,
@@ -284,38 +303,87 @@ async function browserSession(
     cookie: `${SESSION_COOKIE}=${fresh}; HttpOnly; ${new URL(request.url).protocol === "https:" ? "Secure; " : ""}SameSite=Strict; Path=/; Max-Age=86400`,
   };
 }
-async function authenticated(
+/** Turns the pre-accounts shared admin password into the account "admin". */
+async function adminExists(db: D1Database): Promise<boolean> {
+  if (await one(db, "SELECT 1 AS found FROM accounts WHERE role='admin' LIMIT 1"))
+    return true;
+  const legacy = await setting(db, "admin_password");
+  if (!legacy) return false;
+  await db.batch([
+    db
+      .prepare(
+        "INSERT OR IGNORE INTO accounts(username,password_hash,role,created_at) VALUES('admin',?,'admin',?)",
+      )
+      .bind(legacy, now()),
+    db.prepare("DELETE FROM settings WHERE key='admin_password'"),
+  ]);
+  return true;
+}
+async function currentAccount(
   db: D1Database,
   session: BrowserSession,
-): Promise<boolean> {
-  return (
-    session.is_admin === 1 &&
-    session.auth_version === Number((await setting(db, "auth_version")) ?? "0")
+): Promise<Account | null> {
+  if (
+    session.is_admin !== 1 ||
+    session.account_id == null ||
+    session.auth_version !== Number((await setting(db, "auth_version")) ?? "0")
+  )
+    return null;
+  const account = await one<{ id: number; username: string; role: string }>(
+    db,
+    "SELECT id,username,role FROM accounts WHERE id=? AND disabled=0",
+    session.account_id,
   );
+  if (!account) return null;
+  const people = await rows<{ user_id: number }>(
+    db,
+    "SELECT user_id FROM account_users WHERE account_id=?",
+    account.id,
+  );
+  return {
+    id: account.id,
+    username: account.username,
+    role: account.role === "admin" ? "admin" : "user",
+    userIds: people.map((row) => row.user_id),
+  };
+}
+/** Admins see every person; other accounts only the people linked to them. */
+const canSeeUser = (account: Account, userId: number): boolean =>
+  account.role === "admin" || account.userIds.includes(userId);
+/** SQL fragment limiting `column` to the people an account may see. */
+const userScope = (account: Account, column: string): string =>
+  account.role === "admin"
+    ? ""
+    : ` AND ${column} IN (${account.userIds.map(Number).join(",") || "NULL"})`;
+function validUsername(value: string): string {
+  const name = value.trim();
+  if (!name || name.length > 64 || /[\s:\u0000-\u001f]/u.test(name))
+    throw new Error("Invalid username");
+  return name;
 }
 async function rotateSession(
   db: D1Database,
   old: BrowserSession,
-  admin: boolean,
+  accountId: number | null,
   secure: boolean,
 ): Promise<string> {
   const token = randomHex(32);
-  const authVersion = admin
-    ? Number((await setting(db, "auth_version")) ?? "0")
-    : 0;
+  const authVersion =
+    accountId !== null ? Number((await setting(db, "auth_version")) ?? "0") : 0;
   await db.batch([
     db
       .prepare("DELETE FROM admin_sessions WHERE token_hash=?")
       .bind(old.token_hash),
     db
       .prepare(
-        "INSERT INTO admin_sessions(token_hash,csrf,is_admin,auth_version,expires_at) VALUES(?,?,?,?,?)",
+        "INSERT INTO admin_sessions(token_hash,csrf,is_admin,auth_version,account_id,expires_at) VALUES(?,?,?,?,?,?)",
       )
       .bind(
         await digest(token),
         randomHex(24),
-        admin ? 1 : 0,
+        accountId !== null ? 1 : 0,
         authVersion,
+        accountId,
         now() + 7 * 86400,
       ),
   ]);
@@ -873,36 +941,75 @@ async function authLimit(
   );
   return (row?.attempts ?? 0) >= 20;
 }
-async function readingsAuthorized(
+/** Who a Sync API caller is: the whole household or only some people. */
+type SyncScope = { all: true } | { all: false; userIds: number[] };
+/**
+ * Basic auth with an account name and its password sees that account's people
+ * (every person for an admin). The legacy name "reader" keeps whole-household
+ * access with the Sync API password, or with an admin password when the Sync
+ * API shares the admin login.
+ */
+async function readingsScope(
   db: D1Database,
   request: Request,
-): Promise<boolean> {
-  if (await authLimit(db, request, "sync")) return false;
-  const separate =
-    (await setting(db, "sync_password_mode")) === "separate" ||
-    ((await setting(db, "sync_password_mode")) === null &&
-      !!(await setting(db, "api_password")));
-  const encoded = await setting(
-    db,
-    separate ? "api_password" : "admin_password",
-  );
+): Promise<SyncScope | null> {
+  if (await authLimit(db, request, "sync")) return null;
   const authorization = request.headers.get("Authorization") ?? "";
   if (/^Basic /i.test(authorization)) {
     try {
       const decoded = atob(authorization.slice(6));
       const colon = decoded.indexOf(":");
-      const valid =
-        colon > 0 &&
-        decoded.slice(0, colon) === "reader" &&
-        (await passwordMatches(decoded.slice(colon + 1), encoded));
-      await authLimit(db, request, "sync", !valid);
-      return valid;
+      const name = colon > 0 ? decoded.slice(0, colon) : "";
+      const password = colon > 0 ? decoded.slice(colon + 1) : "";
+      const scope = name ? await syncScope(db, name, password) : null;
+      await authLimit(db, request, "sync", !scope);
+      return scope;
     } catch {
       /* Invalid base64 is unauthenticated. */
     }
   }
   await authLimit(db, request, "sync", true);
-  return false;
+  return null;
+}
+async function syncScope(
+  db: D1Database,
+  name: string,
+  password: string,
+): Promise<SyncScope | null> {
+  await adminExists(db); // folds a pre-accounts admin password into an account
+  const mode = await setting(db, "sync_password_mode");
+  const separate =
+    mode === "separate" || (mode === null && !!(await setting(db, "api_password")));
+  const account = await one<{
+    id: number;
+    role: string;
+    password_hash: string | null;
+  }>(
+    db,
+    "SELECT id,role,password_hash FROM accounts WHERE username=? AND disabled=0",
+    name,
+  );
+  if (account && (await passwordMatches(password, account.password_hash))) {
+    if (account.role === "admin") return { all: true };
+    const people = await rows<{ user_id: number }>(
+      db,
+      "SELECT user_id FROM account_users WHERE account_id=?",
+      account.id,
+    );
+    return { all: false, userIds: people.map((row) => row.user_id) };
+  }
+  if (name !== "reader") return null;
+  if (separate)
+    return (await passwordMatches(password, await setting(db, "api_password")))
+      ? { all: true }
+      : null;
+  for (const admin of await rows<{ password_hash: string | null }>(
+    db,
+    "SELECT password_hash FROM accounts WHERE role='admin' AND disabled=0",
+  ))
+    if (await passwordMatches(password, admin.password_hash))
+      return { all: true };
+  return null;
 }
 function readingsUnauthorized(): Response {
   return Response.json(
@@ -917,6 +1024,17 @@ function readingsUnauthorized(): Response {
   );
 }
 async function resolveApiUser(
+  db: D1Database,
+  userRef: string,
+  scope: SyncScope,
+): Promise<{ id: number; name: string } | Response> {
+  const user = await resolveApiPerson(db, userRef);
+  // An account never learns whether a person outside its scope exists.
+  if (user instanceof Response || scope.all || scope.userIds.includes(user.id))
+    return user;
+  return json({ error: "Unknown user" }, 404);
+}
+async function resolveApiPerson(
   db: D1Database,
   userRef: string,
 ): Promise<{ id: number; name: string } | Response> {
@@ -951,8 +1069,9 @@ async function readingsApi(
   userRef: string,
   includeMetrics = false,
 ): Promise<Response> {
-  if (!(await readingsAuthorized(db, request))) return readingsUnauthorized();
-  const user = await resolveApiUser(db, userRef);
+  const scope = await readingsScope(db, request);
+  if (!scope) return readingsUnauthorized();
+  const user = await resolveApiUser(db, userRef, scope);
   if (user instanceof Response) return user;
   const userId = user.id;
   const limit = Number(url.searchParams.get("limit") ?? "100");
@@ -1058,8 +1177,9 @@ async function healthSyncApi(
   userRef: string,
   operation: string,
 ): Promise<Response> {
-  if (!(await readingsAuthorized(db, request))) return readingsUnauthorized();
-  const user = await resolveApiUser(db, userRef);
+  const scope = await readingsScope(db, request);
+  if (!scope) return readingsUnauthorized();
+  const user = await resolveApiUser(db, userRef, scope);
   if (user instanceof Response) return user;
   const userId = user.id;
   if (operation === "ack") {
@@ -1564,7 +1684,7 @@ export async function handleApp(
       ? env.bridgeRequest(request, null)
       : json({ error: "Bridge is unavailable" }, 503);
   }
-  const adminConfigured = !!(await setting(db, "admin_password"));
+  const adminConfigured = await adminExists(db);
   if (!cookieValue(request) && path !== "/setup" && path !== "/login") {
     return redirect(adminConfigured ? "/login" : "/setup");
   }
@@ -1581,9 +1701,12 @@ export async function handleApp(
   }
   const { row: browser, cookie } = await browserSession(db, request);
   const csrf = browser.csrf;
-  const loggedIn = await authenticated(db, browser);
+  const account = await currentAccount(db, browser);
+  const loggedIn = account !== null;
+  const isAdmin = account?.role === "admin";
   if (path.startsWith("/api/bridge/")) {
     if (!loggedIn) return json({ error: "Sign in first" }, 401);
+    if (!isAdmin) return json({ error: "Administrator access required" }, 403);
     if (
       request.headers.get("Origin") !== url.origin &&
       (method === "POST" || path.endsWith("/ui/socket"))
@@ -1605,6 +1728,7 @@ export async function handleApp(
     path === "/api/config/time"
   ) {
     if (!loggedIn) return json({ error: "Sign in first" }, 401);
+    if (!isAdmin) return json({ error: "Administrator access required" }, 403);
     if (
       method === "POST" &&
       (!equal(request.headers.get("X-CSRF-Token") ?? "", csrf) ||
@@ -1629,7 +1753,7 @@ export async function handleApp(
   const t = translator(language);
   const page = (title: string, body: string, active = "") =>
     html(
-      layout(title, body, csrf, loggedIn, notice, active, language),
+      layout(title, body, csrf, account, notice, active, language),
       200,
       cookie,
     );
@@ -1637,6 +1761,7 @@ export async function handleApp(
     redirect(location, message, cookie);
   if (path.startsWith("/api/backup/")) {
     if (!loggedIn) return json({ error: "Sign in first" }, 401);
+    if (!isAdmin) return json({ error: "Administrator access required" }, 403);
     try {
       if (path === "/api/backup/export" && method === "GET")
         return new Response(JSON.stringify(await exportBackup(db), null, 2), {
@@ -1723,7 +1848,7 @@ export async function handleApp(
       path,
       submitted,
       browser,
-      loggedIn,
+      account,
       cookie,
       env.YOW_BOOTSTRAP_TOKEN,
       env.captureWithings,
@@ -1743,11 +1868,31 @@ export async function handleApp(
     return loggedIn
       ? go("/")
       : page(t("auth.signIn"), loginPage(csrf, t));
-  if (!loggedIn) return go("/login");
+  if (!account) return go("/login");
+  if (
+    !isAdmin &&
+    !["/", "/readings", "/sync", "/account"].includes(path) &&
+    !/^\/users\/\d+\/readings$/.test(path)
+  )
+    return go("/", "Administrator access required");
+  if (path === "/account")
+    return page(
+      t("nav.account"),
+      accountPage(
+        account,
+        await rows(
+          db,
+          `SELECT * FROM users WHERE 1=1${userScope(account, "id")} ORDER BY name,id`,
+        ),
+        csrf,
+        language,
+      ),
+      "/account",
+    );
   if (path === "/") {
     const users = await rows(
       db,
-      "SELECT * FROM users WHERE active=1 ORDER BY id",
+      `SELECT * FROM users WHERE active=1${userScope(account, "id")} ORDER BY id`,
     );
     const cards = [];
     for (const user of users) {
@@ -1776,7 +1921,9 @@ export async function handleApp(
         (await setting(db, "display_weight_unit")) ?? "kg",
         await rows(
           db,
-          "SELECT label,model,battery_level,last_session_at FROM scales ORDER BY label,id",
+          isAdmin
+            ? "SELECT label,model,battery_level,last_session_at FROM scales ORDER BY label,id"
+            : `SELECT DISTINCT s.id,s.label,s.model,s.battery_level,s.last_session_at FROM scales s JOIN scale_users su ON su.scale_id=s.id WHERE 1=1${userScope(account, "su.user_id")} ORDER BY s.label,s.id`,
         ),
         language,
       ),
@@ -1784,20 +1931,23 @@ export async function handleApp(
     );
   }
   if (path === "/readings") {
-    const metrics = await observedMetrics(db);
+    const metrics = await observedMetrics(
+      db,
+      isAdmin ? undefined : { userIds: account.userIds, unassigned: true },
+    );
     const metric =
       metrics.find((m) => m.type === Number(url.searchParams.get("metric")))
         ?.type ?? 1;
     const users = await rows(
       db,
-      "SELECT id,name FROM users WHERE active=1 ORDER BY name,id",
+      `SELECT id,name FROM users WHERE active=1${userScope(account, "id")} ORDER BY name,id`,
     );
     const readings = await rows(
       db,
       `SELECT r.*,s.label AS scale_label,u.name AS user_name,
       h.synced_at AS health_sync_acknowledged_at FROM readings r JOIN scales s ON s.id=r.scale_id
       LEFT JOIN users u ON u.id=r.user_id LEFT JOIN health_sync_receipts h ON h.reading_id=r.id AND h.user_id=r.user_id
-      WHERE ${metric === 1 ? "r.weight_value IS NOT NULL" : "EXISTS (SELECT 1 FROM json_each(r.measures_json) m WHERE json_extract(m.value,'$.type')=?)"}
+      WHERE ${metric === 1 ? "r.weight_value IS NOT NULL" : "EXISTS (SELECT 1 FROM json_each(r.measures_json) m WHERE json_extract(m.value,'$.type')=?)"}${isAdmin ? "" : ` AND (r.user_id IS NULL OR r.user_id IN (${account.userIds.map(Number).join(",") || "NULL"}))`}
       ORDER BY ${readingOrder} LIMIT 10`,
       ...(metric === 1 ? [] : [metric]),
     );
@@ -1812,6 +1962,7 @@ export async function handleApp(
         metric,
         language,
         await severalScales(db),
+        isAdmin,
       ),
       "/readings",
     );
@@ -1820,7 +1971,8 @@ export async function handleApp(
   if (userReadings) {
     const id = Number(userReadings[1]);
     const user = await one(db, "SELECT * FROM users WHERE id=?", id);
-    if (!user) return new Response("Not Found", { status: 404 });
+    if (!user || !canSeeUser(account, id))
+      return new Response("Not Found", { status: 404 });
     const metrics = await observedMetrics(db, id);
     const metric =
       metrics.find((m) => m.type === Number(url.searchParams.get("metric")))
@@ -1991,8 +2143,12 @@ export async function handleApp(
       t("nav.sync"),
       syncPage(
         url.origin,
-        await rows(db, "SELECT * FROM users WHERE active=1 ORDER BY name"),
+        await rows(
+          db,
+          `SELECT * FROM users WHERE active=1${userScope(account, "id")} ORDER BY name`,
+        ),
         language,
+        account.username,
       ),
       "/sync",
     );
@@ -2007,20 +2163,200 @@ export async function handleApp(
           (mode === null && !!(await setting(db, "api_password"))),
         languagePreference,
         language,
-      ),
+      ) +
+        accountsSection(
+          csrf,
+          await rows(
+            db,
+            "SELECT id,username,role,disabled FROM accounts ORDER BY username",
+          ),
+          await accountLinks(db),
+          await rows(db, "SELECT id,name FROM users ORDER BY name,id"),
+          account.id,
+          language,
+        ),
       "/settings",
     );
   }
   return new Response("Not Found", { status: 404 });
 }
 
+async function verifyAccountPassword(
+  db: D1Database,
+  accountId: number,
+  password: string,
+): Promise<boolean> {
+  const row = await one<{ password_hash: string | null }>(
+    db,
+    "SELECT password_hash FROM accounts WHERE id=? AND disabled=0",
+    accountId,
+  );
+  return passwordMatches(password, row?.password_hash ?? null);
+}
+/** Sets a new password and signs the account out everywhere else. */
+async function changeOwnPassword(
+  db: D1Database,
+  account: Account,
+  session: BrowserSession,
+  form: FormData,
+): Promise<void> {
+  if (
+    !(await verifyAccountPassword(db, account.id, formText(form, "current")))
+  )
+    throw new Error("Current password is incorrect");
+  if (formText(form, "new") !== formText(form, "confirm"))
+    throw new Error("New passwords do not match");
+  const encoded = await passwordHash(formText(form, "new"));
+  await db.batch([
+    db
+      .prepare("UPDATE accounts SET password_hash=? WHERE id=?")
+      .bind(encoded, account.id),
+    db
+      .prepare("DELETE FROM admin_sessions WHERE account_id=? AND token_hash<>?")
+      .bind(account.id, session.token_hash),
+  ]);
+}
+/** Keeps only ids of people that exist. */
+async function existingPeople(
+  db: D1Database,
+  form: FormData,
+): Promise<number[]> {
+  const ids = [
+    ...new Set(
+      form
+        .getAll("people")
+        .map(Number)
+        .filter((id) => Number.isSafeInteger(id) && id > 0),
+    ),
+  ];
+  if (!ids.length) return [];
+  const found = await rows<{ id: number }>(
+    db,
+    `SELECT id FROM users WHERE id IN (${ids.map(() => "?").join(",")})`,
+    ...ids,
+  );
+  return found.map((row) => row.id);
+}
+const linkPeople = (db: D1Database, accountId: number, ids: number[]) =>
+  ids.map((id) =>
+    db
+      .prepare("INSERT OR IGNORE INTO account_users(account_id,user_id) VALUES(?,?)")
+      .bind(accountId, id),
+  );
+/** Another active administrator besides `accountId` must remain. */
+async function otherAdminExists(
+  db: D1Database,
+  accountId: number,
+): Promise<boolean> {
+  return !!(await one(
+    db,
+    "SELECT 1 AS found FROM accounts WHERE role='admin' AND disabled=0 AND id<>? LIMIT 1",
+    accountId,
+  ));
+}
+/** Admin-only account management: create, edit and delete. */
+async function accountsPost(
+  db: D1Database,
+  path: string,
+  form: FormData,
+  self: Account,
+  go: (location: string, message?: string) => Response,
+): Promise<Response> {
+  if (path === "/accounts") {
+    const username = validUsername(formText(form, "username"));
+    const role = formText(form, "role") === "admin" ? "admin" : "user";
+    const encoded = await passwordHash(formText(form, "password"));
+    if (await one(db, "SELECT id FROM accounts WHERE username=?", username))
+      throw new Error("Username is already taken");
+    await run(
+      db,
+      "INSERT INTO accounts(username,password_hash,role,created_at) VALUES(?,?,?,?)",
+      username,
+      encoded,
+      role,
+      now(),
+    );
+    const created = (await one<{ id: number }>(
+      db,
+      "SELECT id FROM accounts WHERE username=?",
+      username,
+    ))!;
+    let people = await existingPeople(db, form);
+    // Nobody picked: link the people whose name or short name equals the username.
+    if (!people.length && role === "user")
+      people = (
+        await rows<{ id: number }>(
+          db,
+          "SELECT id FROM users WHERE LOWER(name)=LOWER(?) OR LOWER(short_name)=LOWER(?)",
+          username,
+          username,
+        )
+      ).map((row) => row.id);
+    if (people.length) await db.batch(linkPeople(db, created.id, people));
+    return go(
+      "/settings",
+      role === "user" && !people.length
+        ? "Account saved. No person matches the username yet; link people by editing the account."
+        : "Account created",
+    );
+  }
+  const match = /^\/accounts\/(\d+)(\/delete)?$/.exec(path)!;
+  const id = Number(match[1]);
+  const target = await one<{ id: number; role: string; disabled: number }>(
+    db,
+    "SELECT id,role,disabled FROM accounts WHERE id=?",
+    id,
+  );
+  if (!target) return new Response("Not Found", { status: 404 });
+  const own = id === self.id;
+  if (match[2]) {
+    if (own) throw new Error("You cannot change your own role, block or delete your own account here");
+    if (target.role === "admin" && !(await otherAdminExists(db, id)))
+      throw new Error("There must be at least one active administrator");
+    await db.batch([
+      db.prepare("DELETE FROM admin_sessions WHERE account_id=?").bind(id),
+      db.prepare("DELETE FROM accounts WHERE id=?").bind(id),
+    ]);
+    return go("/settings", "Account deleted");
+  }
+  const role = own
+    ? target.role
+    : formText(form, "role") === "admin"
+      ? "admin"
+      : "user";
+  const disabled = own ? 0 : formText(form, "disabled") === "1" ? 1 : 0;
+  if (
+    target.role === "admin" &&
+    (role !== "admin" || disabled) &&
+    !(await otherAdminExists(db, id))
+  )
+    throw new Error("There must be at least one active administrator");
+  const password = formText(form, "password");
+  const encoded = password ? await passwordHash(password) : null;
+  await db.batch([
+    db
+      .prepare("UPDATE accounts SET role=?,disabled=? WHERE id=?")
+      .bind(role, disabled, id),
+    ...(encoded
+      ? [
+          db
+            .prepare("UPDATE accounts SET password_hash=? WHERE id=?")
+            .bind(encoded, id),
+          db.prepare("DELETE FROM admin_sessions WHERE account_id=?").bind(id),
+        ]
+      : []),
+    db.prepare("DELETE FROM account_users WHERE account_id=?").bind(id),
+    ...linkPeople(db, id, await existingPeople(db, form)),
+  ]);
+  return go("/settings", "Account saved");
+}
 async function browserPost(
   request: Request,
   db: D1Database,
   path: string,
   form: FormData,
   session: BrowserSession,
-  loggedIn: boolean,
+  account: Account | null,
   cookie?: string,
   bootstrapToken?: string,
   captureWithings?: (scale: Row) => Promise<string>,
@@ -2028,8 +2364,9 @@ async function browserPost(
   const go = (location: string, message = "", replacement = cookie) =>
     redirect(location, message, replacement);
   const secure = new URL(request.url).protocol === "https:";
+  const loggedIn = account !== null;
   if (path === "/setup") {
-    if (await setting(db, "admin_password")) return go("/login");
+    if (await adminExists(db)) return go("/login");
     if (bootstrapToken && session.is_admin !== 2) {
       if (await authLimit(db, request, "bootstrap"))
         return go("/setup", "Too many attempts; try again in ten minutes");
@@ -2060,6 +2397,7 @@ async function browserPost(
     if (formText(form, "password") !== formText(form, "confirm"))
       return go("/setup", "Passwords do not match");
     try {
+      const username = validUsername(formText(form, "username") || "admin");
       const encoded = await passwordHash(formText(form, "password"));
       const separate = formText(form, "separate_sync") === "1";
       if (
@@ -2070,68 +2408,104 @@ async function browserPost(
       const syncHash = separate
         ? await passwordHash(formText(form, "sync_password"))
         : null;
+      const first =
+        "(SELECT password_hash FROM accounts WHERE role='admin' ORDER BY id LIMIT 1)=?";
       const inserted = await db.batch([
         db
           .prepare(
-            "INSERT OR IGNORE INTO settings(key,value) VALUES('admin_password',?)",
+            "INSERT INTO accounts(username,password_hash,role,created_at) SELECT ?,?,'admin',? WHERE NOT EXISTS (SELECT 1 FROM accounts WHERE role='admin')",
           )
-          .bind(encoded),
+          .bind(username, encoded, now()),
         db.prepare(
           "INSERT OR IGNORE INTO settings(key,value) VALUES('auth_version','1')",
         ),
         db
           .prepare(
-            "INSERT OR IGNORE INTO settings(key,value) SELECT 'sync_password_mode',? WHERE (SELECT value FROM settings WHERE key='admin_password')=?",
+            `INSERT OR IGNORE INTO settings(key,value) SELECT 'sync_password_mode',? WHERE ${first}`,
           )
           .bind(separate ? "separate" : "shared", encoded),
         ...(syncHash
           ? [
               db
                 .prepare(
-                  "INSERT OR IGNORE INTO settings(key,value) SELECT 'api_password',? WHERE (SELECT value FROM settings WHERE key='admin_password')=?",
+                  `INSERT OR IGNORE INTO settings(key,value) SELECT 'api_password',? WHERE ${first}`,
                 )
                 .bind(syncHash, encoded),
             ]
           : []),
       ]);
       if (inserted[0].meta.changes !== 1) return go("/login");
+      const created = await one<{ id: number }>(
+        db,
+        "SELECT id FROM accounts WHERE username=?",
+        username,
+      );
       return go(
         "/",
         "Administration password set",
-        await rotateSession(db, session, true, secure),
+        await rotateSession(db, session, created!.id, secure),
       );
     } catch (error) {
       return go("/setup", safeError(error));
     }
   }
   if (path === "/login") {
-    const encoded = await setting(db, "admin_password");
-    if (!encoded) return go("/setup");
+    if (!(await adminExists(db))) return go("/setup");
     if (await authLimit(db, request, "login"))
       return go("/login", "Too many attempts; try again in ten minutes");
-    if (!(await passwordMatches(formText(form, "password"), encoded))) {
+    const candidate = await one<{ id: number; password_hash: string | null }>(
+      db,
+      "SELECT id,password_hash FROM accounts WHERE username=? AND disabled=0",
+      formText(form, "username").trim(),
+    );
+    if (
+      !candidate ||
+      !(await passwordMatches(
+        formText(form, "password"),
+        candidate.password_hash,
+      ))
+    ) {
       await authLimit(db, request, "login", true);
-      return go("/login", "Invalid password");
+      return go("/login", "Invalid username or password");
     }
     await authLimit(db, request, "login", false);
-    return go("/", "Signed in", await rotateSession(db, session, true, secure));
+    return go(
+      "/",
+      "Signed in",
+      await rotateSession(db, session, candidate.id, secure),
+    );
   }
-  if (!loggedIn) return go("/login");
+  if (!account) return go("/login");
   if (path === "/logout")
     return go(
       "/login",
       "Signed out",
-      await rotateSession(db, session, false, secure),
+      await rotateSession(db, session, null, secure),
     );
 
+  if (
+    account.role !== "admin" &&
+    path !== "/account" &&
+    !/^\/readings\/\d+\/assign$/.test(path) &&
+    !/^\/users\/\d+$/.test(path)
+  )
+    return go("/", "Administrator access required");
+
   try {
+    if (path === "/account") {
+      await changeOwnPassword(db, account, session, form);
+      return go("/account", "Password changed; other sessions were signed out");
+    }
+    if (path === "/accounts" || /^\/accounts\/\d+(\/delete)?$/.test(path))
+      return await accountsPost(db, path, form, account, go);
     if (path === "/settings") {
       const purpose = formText(form, "purpose");
       if (purpose === "sync_password") {
         if (
-          !(await passwordMatches(
+          !(await verifyAccountPassword(
+            db,
+            account.id,
             formText(form, "current_admin"),
-            await setting(db, "admin_password"),
           ))
         )
           throw new Error("Current admin password is incorrect");
@@ -2160,33 +2534,24 @@ async function browserPost(
       }
       if (!["admin_password", "api_password"].includes(purpose))
         return new Response("Bad Request", { status: 400 });
-      const old = await setting(db, "admin_password");
-      const current = formText(
-        form,
-        purpose === "admin_password" ? "current" : "current_admin",
-      );
-      if (!(await passwordMatches(current, old)))
-        throw new Error("Current admin password is incorrect");
-      if (formText(form, "new") !== formText(form, "confirm"))
-        throw new Error("New passwords do not match");
-      const encoded = await passwordHash(formText(form, "new"));
       if (purpose === "admin_password") {
-        const nextVersion =
-          Number((await setting(db, "auth_version")) ?? "0") + 1;
-        await db.batch([
-          saveSetting(db, "admin_password", encoded),
-          saveSetting(db, "auth_version", String(nextVersion)),
-          db
-            .prepare(
-              "UPDATE admin_sessions SET auth_version=? WHERE token_hash=?",
-            )
-            .bind(nextVersion, session.token_hash),
-        ]);
+        await changeOwnPassword(db, account, session, form);
         return go(
           "/settings",
           "Admin password changed; other sessions were signed out",
         );
       }
+      if (
+        !(await verifyAccountPassword(
+          db,
+          account.id,
+          formText(form, "current_admin"),
+        ))
+      )
+        throw new Error("Current admin password is incorrect");
+      if (formText(form, "new") !== formText(form, "confirm"))
+        throw new Error("New passwords do not match");
+      const encoded = await passwordHash(formText(form, "new"));
       await db.batch([
         saveSetting(db, "api_password", encoded),
         saveSetting(db, "sync_password_mode", "separate"),
@@ -2682,8 +3047,32 @@ async function browserPost(
     const userPath = /^\/users\/(\d+)$/.exec(path);
     if (userPath) {
       const id = Number(userPath[1]);
-      if (!(await one(db, "SELECT id FROM users WHERE id=?", id)))
+      if (
+        !(await one(db, "SELECT id FROM users WHERE id=?", id)) ||
+        !canSeeUser(account, id)
+      )
         return new Response("Not Found", { status: 404 });
+      if (account.role !== "admin") {
+        // Accounts edit the profile of their own people only: no scales, no retiring.
+        const profile = parsedUser(form);
+        await run(
+          db,
+          "UPDATE users SET name=?,short_name=?,height_cm=?,age_years=?,birth_date=?,sex=?,reference_weight_kg=? WHERE id=?",
+          profile.name,
+          profile.short,
+          profile.height,
+          profile.age,
+          profile.dob,
+          profile.sex,
+          profile.weight,
+          id,
+        );
+        await queueRosterEdits(db, id);
+        return go(
+          "/account",
+          "User updated; roster edits will be sent to supported scales on their next connection",
+        );
+      }
       if (formText(form, "purpose") === "retire") {
         await db.batch([
           db.prepare("UPDATE users SET active=0 WHERE id=?").bind(id),
@@ -2721,7 +3110,10 @@ async function browserPost(
     if (readingAssign) {
       const id = Number(readingAssign[1]),
         userId = formInteger(form, "user_id");
-      if (!(await one(db, "SELECT id FROM users WHERE id=?", userId)))
+      if (
+        !(await one(db, "SELECT id FROM users WHERE id=?", userId)) ||
+        !canSeeUser(account, userId)
+      )
         throw new Error("Unknown user");
       const [result] = await db.batch([
         db
@@ -2752,10 +3144,14 @@ async function browserPost(
     }
     return new Response("Not Found", { status: 404 });
   } catch (error) {
-    const destination = path.startsWith("/scales")
+    const destination = path.startsWith("/accounts")
+      ? "/settings"
+      : path.startsWith("/scales")
       ? "/scales"
       : path.startsWith("/users")
-        ? "/users"
+        ? account.role === "admin"
+          ? "/users"
+          : "/account"
         : path.startsWith("/readings")
           ? "/readings"
           : path;
