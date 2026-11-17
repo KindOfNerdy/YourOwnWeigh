@@ -338,6 +338,9 @@ details > summary {
 }
 .device-grid label {
   max-width: none;
+  /* The label text takes the spare height, so inputs of one row end up equally
+     tall and aligned at the bottom whatever the label length. */
+  grid-template-rows: 1fr auto;
 }
 .inline-form {
   display: flex;
