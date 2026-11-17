@@ -291,14 +291,16 @@ export function readingsPage(
 ): string {
   const t = translator(language);
   const T = (key: MessageKey) => e(t(key));
+  // With a single person the column says nothing, unless readings still need an owner.
+  const showUser = users.length > 1 || readings.some((r) => !r.user_id);
   return `<section><h1>${T("nav.readings")}</h1>${metricPicker(metrics, metric, "metric", {}, t)}
     ${
       readings.length
-        ? `<div class="wide"><table><thead><tr><th>${T("dashboard.when")}</th><th>${e(metricTitle(metric, t))}</th><th>${T("readings.user")}</th>${showScale ? `<th>${T("dashboard.scale")}</th>` : ""}${metric === 1 ? `<th>${T("readings.healthSync")}</th>` : ""}<th>${T("readings.actions")}</th></tr></thead><tbody>
+        ? `<div class="wide"><table><thead><tr><th>${T("dashboard.when")}</th><th>${e(metricTitle(metric, t))}</th>${showUser ? `<th>${T("readings.user")}</th>` : ""}${showScale ? `<th>${T("dashboard.scale")}</th>` : ""}${metric === 1 ? `<th>${T("readings.healthSync")}</th>` : ""}<th>${T("readings.actions")}</th></tr></thead><tbody>
     ${readings
       .map(
         (r) =>
-          `<tr data-reading-id="${e(r.id)}"><td>${readingTime(r, language)}</td><td>${metricLabel(r, metric, unit, language)}</td><td>${r.user_id ? `<a href="/users/${e(r.user_id)}/readings">${e(r.user_name)}</a>` : `<span class="badge warn">${T("readings.unassigned")}</span>`}</td>${showScale ? `<td>${e(r.scale_label)}</td>` : ""}${metric === 1 ? `<td>${healthSyncStatus(r, language)}</td>` : ""}<td>${
+          `<tr data-reading-id="${e(r.id)}"><td>${readingTime(r, language)}</td><td>${metricLabel(r, metric, unit, language)}</td>${showUser ? `<td>${r.user_id ? `<a href="/users/${e(r.user_id)}/readings">${e(r.user_name)}</a>` : `<span class="badge warn">${T("readings.unassigned")}</span>`}</td>` : ""}${showScale ? `<td>${e(r.scale_label)}</td>` : ""}${metric === 1 ? `<td>${healthSyncStatus(r, language)}</td>` : ""}<td>${
             r.user_id
               ? "—"
               : `<div class="actions">${users.length ? `<form class="inline-form" action="/readings/${e(r.id)}/assign" method="post">${hidden(csrf)}<label class="hint">${T("readings.assignTo")}</label><select name="user_id" required><option value="">${T("readings.chooseUser")}</option>${users.map((u) => option(u.id, u.name, "")).join("")}</select><button>${T("readings.assign")}</button></form>` : ""}
