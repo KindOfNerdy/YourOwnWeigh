@@ -213,10 +213,11 @@ export function loginPage(
   t: Translate = translator("en"),
   oidc?: { name: string; passwordUsers: boolean },
 ): string {
+  // The provider button sits below the password form.
   const provider = oidc
-    ? `<a class="button" href="/login/oidc">${e(t("auth.signInWith", { name: oidc.name }))}</a>${oidc.passwordUsers ? "" : `<p class="hint">${e(t("auth.passwordAdminsOnly"))}</p>`}`
+    ? `<p><a class="button secondary" href="/login/oidc">${e(t("auth.signInWith", { name: oidc.name }))}</a></p>${oidc.passwordUsers ? "" : `<p class="hint">${e(t("auth.passwordAdminsOnly"))}</p>`}`
     : "";
-  return `<section><h1>${e(t("auth.signIn"))}</h1>${provider}<form method="post">${hidden(csrf)}<label>${e(t("auth.username"))}<input name="username" required autocomplete="username"></label><label>${e(t("auth.password"))}<input name="password" type="password" required autocomplete="current-password"></label><button>${e(t("auth.signIn"))}</button></form></section>`;
+  return `<section><h1>${e(t("auth.signIn"))}</h1><form method="post">${hidden(csrf)}<label>${e(t("auth.username"))}<input name="username" required autocomplete="username"></label><label>${e(t("auth.password"))}<input name="password" type="password" required autocomplete="current-password"></label><button>${e(t("auth.signIn"))}</button></form>${provider}</section>`;
 }
 function readingTime(row: Row, language: Language = "en"): string {
   const trusted = row.time_quality === "trusted";
