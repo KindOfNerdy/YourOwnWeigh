@@ -113,6 +113,7 @@ const en = {
   "users.status": "Status",
   "users.active": "Active",
   "users.retired": "Retired",
+  "users.onScale": "Set up on the scale",
   "users.importIntro":
     "Read the selected scale’s existing users and settings over verified HTTPS. New users are shown for selection; existing local users are preserved.",
   "users.chooseScale": "Choose Scale",
@@ -791,6 +792,7 @@ const de: Record<MessageKey, string> = {
   "users.status": "Status",
   "users.active": "Aktiv",
   "users.retired": "Inaktiv",
+  "users.onScale": "Auf der Waage eingerichtet",
   "users.importIntro":
     "Liest die vorhandenen Personen und Einstellungen der gewählten Waage über geprüftes HTTPS. Neue Personen werden zur Auswahl angezeigt; vorhandene lokale Personen bleiben erhalten.",
   "users.chooseScale": "Waage wählen",

@@ -174,6 +174,13 @@ async function run(
     .bind(...args)
     .run();
 }
+async function severalScales(db: D1Database): Promise<boolean> {
+  const count = await one<{ count: number }>(
+    db,
+    "SELECT COUNT(*) AS count FROM scales",
+  );
+  return (count?.count ?? 0) > 1;
+}
 async function setting(db: D1Database, key: string): Promise<string | null> {
   return (
     (
@@ -1804,6 +1811,7 @@ export async function handleApp(
         metrics,
         metric,
         language,
+        await severalScales(db),
       ),
       "/readings",
     );
@@ -1835,6 +1843,7 @@ export async function handleApp(
         metrics,
         metric,
         language,
+        await severalScales(db),
       ),
       "/readings",
     );

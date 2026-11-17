@@ -69,12 +69,13 @@ export function scaleBatteries(
   language: Language = "en",
 ): string {
   const t = translator(language);
+  const named = scales.length > 1;
   const badges = scales
     .map((s) => {
       const level = batteryOf(s);
       if (level === null) return "";
       const low = level <= LOW_BATTERY;
-      return `<span class="badge scale-battery${low ? " warn" : ""}" title="${e(t("battery.reportedTitle", { time: timeLabel(s.last_session_at, language) }))}">${SCALE_ICON}<span>${e(s.label)}</span>${batteryIcon(level)}<span>${level} %</span>${low ? `<span>· ${e(batteryAction(s.model, language))}</span>` : ""}</span>`;
+      return `<span class="badge scale-battery${low ? " warn" : ""}" title="${e(t("battery.reportedTitle", { time: timeLabel(s.last_session_at, language) }))}">${SCALE_ICON}${named ? `<span>${e(s.label)}</span>` : ""}${batteryIcon(level)}<span>${level} %</span>${low ? `<span>· ${e(batteryAction(s.model, language))}</span>` : ""}</span>`;
     })
     .join("");
   return badges ? `<div class="scale-batteries">${badges}</div>` : "";
@@ -234,6 +235,7 @@ export function dashboardPage(
   language: Language = "en",
 ): string {
   const t = translator(language);
+  const showScale = scales.length > 1;
   const selections = Object.fromEntries(
     cards.map(({ user, metric = 1 }) => [`metric_${user.id}`, metric]),
   );
@@ -252,8 +254,8 @@ export function dashboardPage(
     ${metricPicker(metrics, metric, `metric_${user.id}`, selections, t)}
     ${
       readings.length
-        ? `<p class="metric">${metricLabel(readings[0], metric, unit, language)}</p><div class="wide"><table><thead><tr><th>${e(t("dashboard.when"))}</th><th>${e(metricTitle(metric, t))}</th><th>${e(t("dashboard.scale"))}</th></tr></thead><tbody>
-    ${readings.map((r) => `<tr data-reading-id="${e(r.id)}"><td>${readingTime(r, language)}</td><td>${metricLabel(r, metric, unit, language)}</td><td>${e(r.scale_label)}</td></tr>`).join("")}</tbody></table></div>`
+        ? `<p class="metric">${metricLabel(readings[0], metric, unit, language)}</p><div class="wide"><table><thead><tr><th>${e(t("dashboard.when"))}</th><th>${e(metricTitle(metric, t))}</th>${showScale ? `<th>${e(t("dashboard.scale"))}</th>` : ""}</tr></thead><tbody>
+    ${readings.map((r) => `<tr data-reading-id="${e(r.id)}"><td>${readingTime(r, language)}</td><td>${metricLabel(r, metric, unit, language)}</td>${showScale ? `<td>${e(r.scale_label)}</td>` : ""}</tr>`).join("")}</tbody></table></div>`
         : `<p class="empty">${e(t("dashboard.noReadings"))}</p>`
     }</section>`,
           )
@@ -269,17 +271,18 @@ export function readingsPage(
   metrics: Metric[] = [METRICS[0]],
   metric = 1,
   language: Language = "en",
+  showScale = true,
 ): string {
   const t = translator(language);
   const T = (key: MessageKey) => e(t(key));
   return `<section><h1>${T("nav.readings")}</h1>${metricPicker(metrics, metric, "metric", {}, t)}
     ${
       readings.length
-        ? `<div class="wide"><table><thead><tr><th>${T("dashboard.when")}</th><th>${e(metricTitle(metric, t))}</th><th>${T("readings.user")}</th><th>${T("dashboard.scale")}</th>${metric === 1 ? `<th>${T("readings.healthSync")}</th>` : ""}<th>${T("readings.actions")}</th></tr></thead><tbody>
+        ? `<div class="wide"><table><thead><tr><th>${T("dashboard.when")}</th><th>${e(metricTitle(metric, t))}</th><th>${T("readings.user")}</th>${showScale ? `<th>${T("dashboard.scale")}</th>` : ""}${metric === 1 ? `<th>${T("readings.healthSync")}</th>` : ""}<th>${T("readings.actions")}</th></tr></thead><tbody>
     ${readings
       .map(
         (r) =>
-          `<tr data-reading-id="${e(r.id)}"><td>${readingTime(r, language)}</td><td>${metricLabel(r, metric, unit, language)}</td><td>${r.user_id ? `<a href="/users/${e(r.user_id)}/readings">${e(r.user_name)}</a>` : `<span class="badge warn">${T("readings.unassigned")}</span>`}</td><td>${e(r.scale_label)}</td>${metric === 1 ? `<td>${healthSyncStatus(r, language)}</td>` : ""}<td>${
+          `<tr data-reading-id="${e(r.id)}"><td>${readingTime(r, language)}</td><td>${metricLabel(r, metric, unit, language)}</td><td>${r.user_id ? `<a href="/users/${e(r.user_id)}/readings">${e(r.user_name)}</a>` : `<span class="badge warn">${T("readings.unassigned")}</span>`}</td>${showScale ? `<td>${e(r.scale_label)}</td>` : ""}${metric === 1 ? `<td>${healthSyncStatus(r, language)}</td>` : ""}<td>${
             r.user_id
               ? "—"
               : `<div class="actions">${users.length ? `<form class="inline-form" action="/readings/${e(r.id)}/assign" method="post">${hidden(csrf)}<label class="hint">${T("readings.assignTo")}</label><select name="user_id" required><option value="">${T("readings.chooseUser")}</option>${users.map((u) => option(u.id, u.name, "")).join("")}</select><button>${T("readings.assign")}</button></form>` : ""}
@@ -298,16 +301,17 @@ export function userReadingsPage(
   metrics: Metric[] = [METRICS[0]],
   metric = 1,
   language: Language = "en",
+  showScale = true,
 ): string {
   const t = translator(language);
   const T = (key: MessageKey) => e(t(key));
   return `<section><a href="/">${T("userReadings.back")}</a><h1>${e(t("userReadings.title", { name: String(user.name ?? "") }))}</h1>${metricPicker(metrics, metric, "metric", {}, t)}
     ${
       readings.length
-        ? `<div class="wide"><table><thead><tr><th>${T("dashboard.when")}</th><th>${e(metricTitle(metric, t))}</th><th>${T("dashboard.scale")}</th><th>${T("userReadings.attribution")}</th>${metric === 1 ? `<th>${T("readings.healthSync")}</th>` : ""}</tr></thead><tbody>${readings
+        ? `<div class="wide"><table><thead><tr><th>${T("dashboard.when")}</th><th>${e(metricTitle(metric, t))}</th>${showScale ? `<th>${T("dashboard.scale")}</th>` : ""}<th>${T("userReadings.attribution")}</th>${metric === 1 ? `<th>${T("readings.healthSync")}</th>` : ""}</tr></thead><tbody>${readings
             .map(
               (r) =>
-                `<tr><td>${readingTime(r, language)}</td><td>${metricLabel(r, metric, unit, language)}</td><td>${e(r.scale_label)}</td><td>${e(attributionLabel(r.attribution, t))}</td>${metric === 1 ? `<td>${healthSyncStatus(r, language)}</td>` : ""}</tr>`,
+                `<tr><td>${readingTime(r, language)}</td><td>${metricLabel(r, metric, unit, language)}</td>${showScale ? `<td>${e(r.scale_label)}</td>` : ""}<td>${e(attributionLabel(r.attribution, t))}</td>${metric === 1 ? `<td>${healthSyncStatus(r, language)}</td>` : ""}</tr>`,
             )
             .join("")}</tbody></table></div>`
         : `<p class="empty">${T("userReadings.none")}</p>`
@@ -326,7 +330,13 @@ function userFields(
     <label>${T("users.approxAge")}<input name="age_years" type="number" step="0.1" value="${e(user?.age_years)}"></label>
     <label>${T("users.sex")}<select name="sex">${option(0, t("users.male"), user?.sex ?? 0)}${option(1, t("users.female"), user?.sex ?? 0)}</select></label>
     <label>${T("users.recognitionWeight")}<input name="reference_weight_kg" type="number" step="any" value="${e(user?.reference_weight_kg)}" title="${T("users.recognitionHint")}" required></label></div>
-    <fieldset><legend>${T("nav.scales")}</legend>${scales.map((s) => `<label><input type="checkbox" name="scales" value="${e(s.id)}"${members.has(s.id) ? " checked" : ""}> ${e(s.label)}</label>`).join("")}</fieldset>`;
+    ${
+      scales.length > 1
+        ? `<fieldset><legend>${T("nav.scales")}</legend>${scales.map((s) => `<label><input type="checkbox" name="scales" value="${e(s.id)}"${members.has(s.id) ? " checked" : ""}> ${e(s.label)}</label>`).join("")}</fieldset>`
+        : scales.length === 1
+          ? `<label><input type="checkbox" name="scales" value="${e(scales[0].id)}"${!user || members.has(scales[0].id) ? " checked" : ""}> ${T("users.onScale")}</label>`
+          : ""
+    }`;
 }
 export function usersPage(
   users: Row[],
@@ -354,6 +364,7 @@ export function usersPage(
 ): string {
   const t = translator(language);
   const T = (key: MessageKey) => e(t(key));
+  const showScales = scales.length > 1;
   return `<section><div class="page-heading"><div><h1>${T("nav.users")}</h1></div><div class="actions"><button type="button" class="secondary" data-open-dialog="import-users-dialog">${T("users.importWithings")}</button><button type="button" data-open-dialog="add-user-dialog">${T("users.add")}</button></div></div>
     ${
       preview
@@ -365,25 +376,27 @@ export function usersPage(
     }
     ${
       users.length
-        ? `<div class="wide"><table><thead><tr><th>${T("users.name")}</th><th>${T("users.shortName")}</th><th>${T("users.height")}</th><th>${T("users.ageDob")}</th><th>${T("users.sex")}</th><th>${T("nav.scales")}</th><th>${T("users.status")}</th><th></th></tr></thead><tbody>
+        ? `<div class="wide"><table><thead><tr><th>${T("users.name")}</th><th>${T("users.shortName")}</th><th>${T("users.height")}</th><th>${T("users.ageDob")}</th><th>${T("users.sex")}</th>${showScales ? `<th>${T("nav.scales")}</th>` : ""}<th>${T("users.status")}</th><th></th></tr></thead><tbody>
     ${users
       .map(
         (
           u,
         ) => `<tr><td>${e(u.name)}</td><td>${e(u.short_name)}</td><td>${Math.round(n(u.height_cm))} cm</td><td>${e(u.birth_date || u.age_years)}</td><td>${u.sex === 0 ? T("users.male") : T("users.female")}</td>
-      <td>${scales
-        .filter((s) => memberships.get(u.id)?.has(s.id))
-        .map((s) => e(s.label))
-        .join(
-          ", ",
-        )}</td><td>${u.active ? T("users.active") : T("users.retired")}</td><td><button type="button" class="secondary" data-open-dialog="edit-user-${e(u.id)}">${T("common.edit")}</button></td></tr>`,
+      ${
+        showScales
+          ? `<td>${scales
+              .filter((s) => memberships.get(u.id)?.has(s.id))
+              .map((s) => e(s.label))
+              .join(", ")}</td>`
+          : ""
+      }<td>${u.active ? T("users.active") : T("users.retired")}</td><td><button type="button" class="secondary" data-open-dialog="edit-user-${e(u.id)}">${T("common.edit")}</button></td></tr>`,
       )
       .join("")}</tbody></table></div>`
         : `<p class="empty">${T("dashboard.noUsers")}</p>`
     }</section>
     <dialog id="import-users-dialog"${importScaleId ? " data-auto-open" : ""}><button type="button" class="dialog-close" data-close-dialog>×</button><h2>${T("users.importWithings")}</h2>
       <p>${T("users.importIntro")}</p>
-      ${fetchMode ? `<form action="/users/fetch-withings" method="post">${hidden(csrf)}<label>${T("dashboard.scale")}<select name="scale_id" required><option value="">${T("users.chooseScale")}</option>${scales.map((s) => option(s.id, s.label, importScaleId ?? "")).join("")}</select></label><button>${T("users.fetch")}</button></form>` : `<p>${T("users.importUnavailable")}</p>`}</dialog>
+      ${fetchMode ? `<form action="/users/fetch-withings" method="post">${hidden(csrf)}<label>${T("dashboard.scale")}<select name="scale_id" required><option value="">${T("users.chooseScale")}</option>${scales.map((s) => option(s.id, s.label, importScaleId ?? (scales.length === 1 ? scales[0].id : ""))).join("")}</select></label><button>${T("users.fetch")}</button></form>` : `<p>${T("users.importUnavailable")}</p>`}</dialog>
     <dialog id="add-user-dialog"><button type="button" class="dialog-close" data-close-dialog>×</button><h2>${T("users.add")}</h2><form action="/users" method="post">${hidden(csrf)}${userFields(null, scales, new Set(), t)}<button>${T("users.save")}</button></form></dialog>
     ${users
       .map(
