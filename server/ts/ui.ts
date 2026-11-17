@@ -174,8 +174,8 @@ export function layout(
     ["/sync", t("nav.sync")],
     ...(account?.role === "admin"
       ? [
-          ["/settings", t("nav.settings")],
           ["/firmware", t("nav.firmware")],
+          ["/admin", t("nav.admin")],
         ]
       : []),
     ["/account", t("nav.account")],
@@ -359,7 +359,10 @@ export function accountPage(
   const t = translator(language);
   const T = (key: MessageKey) => e(t(key));
   return `<section class="page-heading"><div><h1>${T("account.title")}</h1><p>${e(t("account.signedInAs", { name: account.username }))} · ${T(account.role === "admin" ? "account.role.admin" : "account.role.user")}</p></div></section>
-    <div class="firmware-grid"><section><h2>${T("account.changePassword")}</h2><form action="/account" method="post">${hidden(csrf)}
+    <div class="firmware-grid"><section><h2>${T("account.changeUsername")}</h2><form action="/account" method="post">${hidden(csrf)}<input type="hidden" name="purpose" value="username">
+      <label>${T("auth.username")}<input name="username" value="${e(account.username)}" maxlength="64" required autocomplete="username"></label>
+      <button>${T("users.save")}</button></form></section>
+    <section><h2>${T("account.changePassword")}</h2><form action="/account" method="post">${hidden(csrf)}
       <label>${T("account.currentPassword")}<input name="current" type="password" required autocomplete="current-password"></label>
       <label>${T("account.newPassword")}<input name="new" type="password" minlength="8" required autocomplete="new-password"></label>
       <label>${T("account.confirmPassword")}<input name="confirm" type="password" minlength="8" required autocomplete="new-password"></label>

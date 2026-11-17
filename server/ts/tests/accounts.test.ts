@@ -156,7 +156,7 @@ test("an administrator creates a user account that is linked by name and sees on
     const created = await admin.post(
       "/accounts",
       { username: "jane", password: "jane-password-1", role: "user" },
-      "/settings",
+      "/admin",
     );
     assert.match(location(created), /Account\+created/);
     const links = await h.db.prepare("SELECT user_id FROM account_users").all<{ user_id: number }>();
@@ -174,12 +174,12 @@ test("an administrator creates a user account that is linked by name and sees on
     assert.doesNotMatch(readings, /\/readings\/3\/delete/);
     assert.equal((await jane.call("/users/1/readings")).status, 200);
     assert.equal((await jane.call("/users/2/readings")).status, 404);
-    for (const path of ["/users", "/scales", "/settings", "/firmware"])
+    for (const path of ["/users", "/scales", "/admin", "/settings", "/firmware"])
       assert.match(location(await jane.call(path)), /^\/\?notice=Administrator\+access\+required/);
     assert.equal((await jane.call("/api/backup/export")).status, 403);
     assert.equal((await jane.call("/api/devices")).status, 403);
     const nav = await (await jane.call("/")).text();
-    assert.doesNotMatch(nav, /href="\/users"|href="\/settings"|href="\/firmware"/);
+    assert.doesNotMatch(nav, /href="\/users"|href="\/admin"|href="\/firmware"/);
     assert.match(nav, /href="\/account"/);
   } finally {
     h.close();
@@ -190,7 +190,7 @@ test("users assign unassigned readings only to their own people and cannot delet
   const h = await household();
   try {
     const admin = await adminBrowser(h.env);
-    await admin.post("/accounts", { username: "jane", password: "jane-password-1", role: "user" }, "/settings");
+    await admin.post("/accounts", { username: "jane", password: "jane-password-1", role: "user" }, "/admin");
     const jane = browser(h.env);
     await jane.login("jane", "jane-password-1");
     const foreign = await jane.post("/readings/3/assign", { user_id: "2" }, "/readings");
@@ -213,7 +213,7 @@ test("users edit the profile of their own people only", async () => {
   const h = await household();
   try {
     const admin = await adminBrowser(h.env);
-    await admin.post("/accounts", { username: "jane", password: "jane-password-1", role: "user" }, "/settings");
+    await admin.post("/accounts", { username: "jane", password: "jane-password-1", role: "user" }, "/admin");
     const jane = browser(h.env);
     await jane.login("jane", "jane-password-1");
     const profile = {
@@ -255,17 +255,17 @@ test("administrators cannot demote, block or delete their own account", async ()
       [`/accounts/${own}/delete`, {}],
       [`/accounts/${own}`, { role: "user", disabled: "1" }],
     ] as const) {
-      const response = await admin.post(path, fields, "/settings");
-      assert.match(location(response), /^\/settings/);
+      const response = await admin.post(path, fields, "/admin");
+      assert.match(location(response), /^\/admin/);
     }
     assert.deepEqual(
       { ...(await h.db.prepare("SELECT role,disabled FROM accounts WHERE id=?").bind(own).first()) },
       { role: "admin", disabled: 0 },
     );
     // A second administrator can be created, edited and removed again.
-    await admin.post("/accounts", { username: "second", password: "second-pass-1", role: "admin" }, "/settings");
+    await admin.post("/accounts", { username: "second", password: "second-pass-1", role: "admin" }, "/admin");
     const second = (await h.db.prepare("SELECT id FROM accounts WHERE username='second'").first<{ id: number }>())!.id;
-    assert.match(location(await admin.post(`/accounts/${second}/delete`, {}, "/settings")), /Account\+deleted/);
+    assert.match(location(await admin.post(`/accounts/${second}/delete`, {}, "/admin")), /Account\+deleted/);
     assert.equal((await h.db.prepare("SELECT COUNT(*) AS c FROM accounts").first<{ c: number }>())?.c, 1);
   } finally {
     h.close();
@@ -276,12 +276,12 @@ test("a disabled account cannot sign in and its sessions end", async () => {
   const h = await household();
   try {
     const admin = await adminBrowser(h.env);
-    await admin.post("/accounts", { username: "jane", password: "jane-password-1", role: "user" }, "/settings");
+    await admin.post("/accounts", { username: "jane", password: "jane-password-1", role: "user" }, "/admin");
     const jane = browser(h.env);
     await jane.login("jane", "jane-password-1");
     assert.equal((await jane.call("/")).status, 200);
     const id = (await h.db.prepare("SELECT id FROM accounts WHERE username='jane'").first<{ id: number }>())!.id;
-    await admin.post(`/accounts/${id}`, { role: "user", disabled: "1" }, "/settings");
+    await admin.post(`/accounts/${id}`, { role: "user", disabled: "1" }, "/admin");
     assert.equal(location(await jane.call("/")), "/login");
     assert.match(location(await browser(h.env).login("jane", "jane-password-1")), /Invalid\+username/);
   } finally {
@@ -293,7 +293,7 @@ test("the Sync API follows the account: own people only, administrators and read
   const h = await household();
   try {
     const admin = await adminBrowser(h.env);
-    await admin.post("/accounts", { username: "jane", password: "jane-password-1", role: "user" }, "/settings");
+    await admin.post("/accounts", { username: "jane", password: "jane-password-1", role: "user" }, "/admin");
     const get = (path: string, user: string, password: string) =>
       handleApp(
         new Request(`${ORIGIN}${path}`, {
@@ -317,7 +317,7 @@ test("changing the own password signs out the other sessions of that account onl
   const h = await household();
   try {
     const admin = await adminBrowser(h.env);
-    await admin.post("/accounts", { username: "jane", password: "jane-password-1", role: "user" }, "/settings");
+    await admin.post("/accounts", { username: "jane", password: "jane-password-1", role: "user" }, "/admin");
     const first = browser(h.env);
     const second = browser(h.env);
     await first.login("jane", "jane-password-1");
@@ -347,7 +347,7 @@ test("a backup carries the accounts and their people, restoring access replaces 
   const target = await household();
   try {
     const admin = await adminBrowser(source.env);
-    await admin.post("/accounts", { username: "jane", password: "jane-password-1", role: "user" }, "/settings");
+    await admin.post("/accounts", { username: "jane", password: "jane-password-1", role: "user" }, "/admin");
     const backup = await exportBackup(source.db);
     const entry = backup.accessSettings.find((r) => r.key === "accounts");
     assert.ok(entry);
@@ -380,20 +380,22 @@ test("a backup carries the accounts and their people, restoring access replaces 
   }
 });
 
-test("administrators rename accounts; names stay unique", async () => {
+test("accounts rename themselves; names stay unique", async () => {
   const h = await household();
   try {
     const admin = await adminBrowser(h.env);
-    await admin.post("/accounts", { username: "jane", password: "jane-password-1", role: "user" }, "/settings");
-    const id = (await h.db.prepare("SELECT id FROM accounts WHERE username='jane'").first<{ id: number }>())!.id;
+    await admin.post("/accounts", { username: "jane", password: "jane-password-1", role: "user" }, "/admin");
+    const jane = browser(h.env);
+    await jane.login("jane", "jane-password-1");
     assert.match(
-      location(await admin.post(`/accounts/${id}`, { username: "Owner", role: "user" }, "/settings")),
+      location(await jane.post("/account", { purpose: "username", username: "Owner" })),
       /Username\+is\+already\+taken/,
     );
     assert.match(
-      location(await admin.post(`/accounts/${id}`, { username: "jane.d", role: "user", people: "1" }, "/settings")),
-      /Account\+saved/,
+      location(await jane.post("/account", { purpose: "username", username: "jane.d" })),
+      /Username\+changed/,
     );
+    assert.equal((await jane.call("/")).status, 200);
     assert.equal(
       location(await browser(h.env).login("jane.d", "jane-password-1")).startsWith("/?"),
       true,
