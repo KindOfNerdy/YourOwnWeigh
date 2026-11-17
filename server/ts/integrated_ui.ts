@@ -217,15 +217,22 @@ export function accountsSection(
   people: Row[],
   selfId: number,
   language: Language = "en",
+  oidcEnabled = false,
 ): string {
   const t = translator(language);
   const T = (key: MessageKey) => e(t(key));
+  const oidcName = (value: unknown) =>
+    oidcEnabled
+      ? `<label>${T("accounts.oidcUsername")}<input name="oidc_username" value="${e(value ?? "")}" maxlength="64" autocomplete="off"></label>`
+      : "";
   const checkboxes = (selected: Set<number>) =>
     people.length
       ? `<fieldset><legend>${T("accounts.people")}</legend>${people.map((p) => `<label><input type="checkbox" name="people" value="${e(p.id)}"${selected.has(Number(p.id)) ? " checked" : ""}> ${e(p.name)}</label>`).join("")}</fieldset>`
       : "";
   const roleSelect = (role: string, disabled = false) =>
     `<label>${T("accounts.role")}<select name="role"${disabled ? " disabled" : ""}><option value="user"${role === "user" ? " selected" : ""}>${T("account.role.user")}</option><option value="admin"${role === "admin" ? " selected" : ""}>${T("account.role.admin")}</option></select></label>`;
+  const seeAll = (checked: boolean) =>
+    `<label><input type="checkbox" name="see_all" value="1"${checked ? " checked" : ""}> ${T("accounts.seeAll")}</label>`;
   const names = (id: number) =>
     people
       .filter((p) => links.get(id)?.has(Number(p.id)))
@@ -235,23 +242,59 @@ export function accountsSection(
     <div class="wide"><table><thead><tr><th>${T("auth.username")}</th><th>${T("accounts.role")}</th><th>${T("accounts.people")}</th><th>${T("users.status")}</th><th></th></tr></thead><tbody>${accounts
       .map(
         (a) =>
-          `<tr><td>${e(a.username)}</td><td>${T(a.role === "admin" ? "account.role.admin" : "account.role.user")}</td><td>${a.role === "admin" ? T("accounts.everyone") : names(Number(a.id))}</td><td>${a.disabled ? T("accounts.disabled") : T("users.active")}</td><td><button type="button" class="secondary" data-open-dialog="edit-account-${e(a.id)}">${T("common.edit")}</button></td></tr>`,
+          `<tr><td>${e(a.username)}</td><td>${T(a.role === "admin" ? "account.role.admin" : "account.role.user")}</td><td>${a.role === "admin" && a.see_all ? T("accounts.everyone") : names(Number(a.id))}</td><td>${a.disabled ? T("accounts.disabled") : T("users.active")}${a.oidc_linked ? ` · ${T("accounts.oidcLinked")}` : ""}</td><td><button type="button" class="secondary" data-open-dialog="edit-account-${e(a.id)}">${T("common.edit")}</button></td></tr>`,
       )
       .join("")}</tbody></table></div>
     <dialog id="add-account-dialog"><button type="button" class="dialog-close" data-close-dialog aria-label="${T("common.close")}">×</button><h2>${T("accounts.add")}</h2><form action="/accounts" method="post">${hidden(csrf)}
       <label>${T("auth.username")}<input name="username" maxlength="64" required autocomplete="off"></label>
-      <label>${T("auth.password")}<input name="password" type="password" minlength="8" required autocomplete="new-password"></label>
-      ${roleSelect("user")}${checkboxes(new Set())}<p class="hint">${T("accounts.matchHint")}</p>
+      <label>${T("auth.password")}<input name="password" type="password" minlength="8"${oidcEnabled ? "" : " required"} autocomplete="new-password"></label>
+      ${oidcName("")}${oidcEnabled ? `<p class="hint">${T("accounts.passwordOptionalHint")}</p>` : ""}
+      ${roleSelect("user")}${seeAll(true)}${checkboxes(new Set())}<p class="hint">${T("accounts.matchHint")}</p>
       <div class="dialog-actions"><button>${T("users.save")}</button></div></form></dialog>
     ${accounts
       .map((a) => {
         const self = Number(a.id) === selfId;
         return `<dialog id="edit-account-${e(a.id)}"><button type="button" class="dialog-close" data-close-dialog aria-label="${T("common.close")}">×</button><h2>${e(t("users.edit", { name: String(a.username) }))}</h2><form action="/accounts/${e(a.id)}" method="post">${hidden(csrf)}
-      ${roleSelect(String(a.role), self)}${checkboxes(links.get(Number(a.id)) ?? new Set())}
+      ${roleSelect(String(a.role), self)}${seeAll(!!a.see_all)}${checkboxes(links.get(Number(a.id)) ?? new Set())}
       ${self ? "" : `<label><input type="checkbox" name="disabled" value="1"${a.disabled ? " checked" : ""}> ${T("accounts.disable")}</label>`}
+      ${oidcName(a.oidc_username)}
+      ${oidcEnabled && a.oidc_linked ? `<label><input type="checkbox" name="unlink_oidc" value="1"> ${T("accounts.unlinkOidc")}</label>` : ""}
       <label>${T("accounts.resetPassword")}<input name="password" type="password" minlength="8" autocomplete="new-password"></label>
+      ${oidcEnabled && a.has_password ? `<label><input type="checkbox" name="remove_password" value="1"> ${T("accounts.removePassword")}</label>` : ""}
       <div class="dialog-actions"><button>${T("users.save")}</button></div></form>
       ${self ? "" : `<div class="dialog-actions"><form action="/accounts/${e(a.id)}/delete" method="post" data-confirm="${T("accounts.confirmDelete")}">${hidden(csrf)}<button class="danger">${T("accounts.delete")}</button></form></div>`}</dialog>`;
       })
       .join("")}</section>`;
+}
+
+/** Admin card: OpenID Connect sign-in. The secret is never sent back to the page. */
+export function oidcSection(
+  csrf: string,
+  o: {
+    enabled: boolean;
+    name: string;
+    issuer: string;
+    clientId: string;
+    hasSecret: boolean;
+    autoCreate: boolean;
+    passwordUsers: boolean;
+  },
+  redirectUri: string,
+  language: Language = "en",
+): string {
+  const t = translator(language);
+  const T = (key: MessageKey) => e(t(key));
+  const box = (name: string, checked: boolean, label: MessageKey) =>
+    `<label><input type="checkbox" name="${name}" value="1"${checked ? " checked" : ""}> ${T(label)}</label>`;
+  return `<section class="oidc-panel"><h2>${T("oidc.title")}</h2><p>${T("oidc.intro")}</p>
+    <form action="/oidc" method="post">${hidden(csrf)}
+      ${box("enabled", o.enabled, "oidc.enable")}
+      <div class="device-grid"><label>${T("oidc.name")}<input name="name" value="${e(o.name)}" maxlength="40"></label>
+      <label>${T("oidc.issuer")}<input name="issuer" type="url" value="${e(o.issuer)}" placeholder="https://id.example.com"></label>
+      <label>${T("oidc.clientId")}<input name="client_id" value="${e(o.clientId)}" autocomplete="off"></label>
+      <label>${T("oidc.clientSecret")}<input name="client_secret" type="password" autocomplete="new-password" placeholder="${o.hasSecret ? "••••••••" : ""}"></label></div>
+      ${box("auto_create", o.autoCreate, "oidc.autoCreate")}
+      ${box("password_users", o.passwordUsers, "oidc.passwordUsers")}
+      <p class="hint">${T("oidc.redirectUri")} <code>${e(redirectUri)}</code></p>
+      <button>${T("users.save")}</button></form></section>`;
 }

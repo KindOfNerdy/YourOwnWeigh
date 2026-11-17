@@ -161,6 +161,17 @@ export class LocalSqlite {
         ),
       );
     }
+    if (
+      !(
+        this.database.prepare("PRAGMA table_info(accounts)").all() as Array<{
+          name: string;
+        }>
+      ).some((c) => c.name === "oidc_username")
+    ) {
+      this.database.exec(
+        readFileSync(join(ROOT, "server/migrations/0013_oidc.sql"), "utf8"),
+      );
+    }
   }
   private upgradeOlderDatabase(): void {
     const columns = (table: string): Set<string> =>
