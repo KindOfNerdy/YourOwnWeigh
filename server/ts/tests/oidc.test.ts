@@ -315,7 +315,7 @@ test("password sign-in can be switched off for users while administrators keep i
     assert.match(location(await browser(h.env).login("jane", "jane-password-1")), /Invalid\+username/);
     assert.equal(location(await browser(h.env).login("owner", PASSWORD)).startsWith("/?"), true);
     const page = await (await handleApp(new Request(`${ORIGIN}/login`), h.env)).text();
-    assert.match(page, /administrators only/);
+    assert.doesNotMatch(page, /administrators only/i);
     // Disabling OIDC puts the password login back for everybody.
     await configure({ enabled: "", password_users: "" });
     assert.equal(location(await browser(h.env).login("jane", "jane-password-1")).startsWith("/?"), true);
