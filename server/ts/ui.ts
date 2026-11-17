@@ -288,11 +288,12 @@ export function readingsPage(
   language: Language = "en",
   showScale = true,
   canDelete = true,
+  visiblePeople = users.length,
 ): string {
   const t = translator(language);
   const T = (key: MessageKey) => e(t(key));
-  // With a single person the column says nothing, unless readings still need an owner.
-  const showUser = users.length > 1 || readings.some((r) => !r.user_id);
+  // With a single visible person the column says nothing, unless readings still need an owner.
+  const showUser = visiblePeople > 1 || readings.some((r) => !r.user_id);
   return `<section><h1>${T("nav.readings")}</h1>${metricPicker(metrics, metric, "metric", {}, t)}
     ${
       readings.length

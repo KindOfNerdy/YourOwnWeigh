@@ -2358,6 +2358,12 @@ export async function handleApp(
         language,
         await severalScales(db),
         isAdmin,
+        (
+          await one<{ count: number }>(
+            db,
+            `SELECT COUNT(*) AS count FROM users WHERE active=1${userScope(account, "id")}`,
+          )
+        )?.count ?? 0,
       ),
       "/readings",
     );
